@@ -475,8 +475,14 @@
   });
   $('setup-all-versions').addEventListener('change', renderVersions);
   for (const button of document.querySelectorAll('[data-setup-step]')) button.addEventListener('click', () => saveSetup(button.dataset.setupStep));
-  for (const id of ['setup-save-close', 'setup-later']) $(id).addEventListener('click', () => saveSetup(setupDraft.step, true));
-  $('setup-dialog').addEventListener('cancel', event => { event.preventDefault(); void saveSetup(setupDraft.step, true); });
+  function exitSetup() {
+    if (isBusy()) return;
+    // Closing an uncreated world is cancellation, not permission to persist or create it.
+    if (!setupServer()) closeSetup();
+    else void saveSetup(setupDraft.step, true);
+  }
+  for (const id of ['setup-save-close', 'setup-later']) $(id).addEventListener('click', exitSetup);
+  $('setup-dialog').addEventListener('cancel', event => { event.preventDefault(); exitSetup(); });
   $('setup-close-unsaved').addEventListener('click', () => closeSetup());
   $('setup-dialog').addEventListener('close', () => {
     renderFriends();
@@ -1016,7 +1022,7 @@
 
   function gatewayStatusText(label) {
     const detail = state?.gateway?.detail || '';
-    if (/Park and Claim once/.test(detail)) return 'One-time step: Stop server (it hands the world to your always-on PC), then press Take over hosting and Start server again. After that, the always-on PC address works every time you host.';
+    if (/Park and Claim once/.test(detail)) return 'One-time step: Stop server (it hands the world to your always-on PC), then press Start server again. After that, the always-on PC address works every time you host.';
     if (state?.gateway?.state === 'ready') return `Ready · ${detail || 'tunnel connected'}. Friends can join through your always-on PC while this server runs.`;
     return `${label}${detail ? ` · ${detail}` : ''}.`;
   }
@@ -1102,7 +1108,7 @@
       $('stop-timeout').value = server?.profile?.stopTimeoutSeconds ?? '';
     }
     $('profile-feedback').textContent = !server ? 'Create or import a server first.' : profileDirty ? 'Unsaved changes · save before starting.' : active ? 'Stop the server to edit these settings.' : 'Saved.';
-    const hint = !server ? '' : !bridgeReady ? 'Seed Hosting can’t reach its background service; buttons are paused.' : isBusy() ? '' : active ? '' : server.modInstallError ? `${server.modInstallError}. Repair the mod files before starting.` : pendingOffer() ? 'Your world is being handed to another PC. Use Retry on that PC if it didn’t finish; if they decline, it comes back here.' : !ownsServer() ? ownership?.state === 'uncertain' && ownership.owner === state.deviceId ? 'No server process is tracked here. Confirm previous processes are stopped & recover local ownership before starting.' : 'Hosting authority is not confirmed on this PC. Check the group and hand-over status before starting.' : profileDirty ? 'Save your launch settings before starting.' : '';
+    const hint = !server ? '' : !bridgeReady ? 'Seed Hosting can’t reach its background service; buttons are paused.' : isBusy() ? '' : active ? '' : server.modInstallError ? `${server.modInstallError}. Repair the mod files before starting.` : pendingOffer() ? 'Your world is being handed to another PC. Use Retry on that PC if it didn’t finish; if they decline, it comes back here.' : !ownsServer() ? ownership?.state === 'uncertain' && ownership.owner === state.deviceId ? 'No server process is tracked here. Confirm previous processes are stopped & recover local ownership before starting.' : server.group ? 'Press Start server to sync the latest world from the group and host it here.' : 'This PC does not hold the latest copy of this world. Check the hand-over status before starting.' : profileDirty ? 'Save your launch settings before starting.' : '';
     const needsJava = Boolean(server) && !hint && !active && (!server.profile?.executable || !server.profile?.args?.length);
     $('server-action-hint').textContent = needsJava ? 'Choose Java before starting: open the Setup guide → Memory → Advanced: change Java.' : hint; $('server-action-hint').hidden = !needsJava && !hint;
     $('server-toolbar').hidden = !server;
@@ -1172,6 +1178,7 @@
   }
 
   let renderedMods = null;
+  $('installed-mod-query').addEventListener('input', renderMods);
   function renderMods() {
     const server = state?.server;
     const mods = server?.mods || { server: [], client: [] };
@@ -1180,11 +1187,13 @@
     $('add-server-mods').disabled = !editable;
     $('add-client-mods').disabled = !editable;
     $('export-client-pack').disabled = !bridgeReady || isBusy() || Boolean(server?.modsError) || !mods.client.length;
-    const signature = JSON.stringify(mods);
+    const query = $('installed-mod-query').value.trim().toLocaleLowerCase();
+    const signature = JSON.stringify([server?.id, mods, query]);
     if (signature !== renderedMods) {
       renderedMods = signature;
       for (const kind of ['server', 'client']) {
-        $(`${kind}-mods`).replaceChildren(...mods[kind].map((mod) => {
+        const filtered = mods[kind].filter(mod => mod.name.toLocaleLowerCase().includes(query));
+        $(`${kind}-mods`).replaceChildren(...filtered.map((mod) => {
           const item = element('li', 'mod-item');
           const remove = element('button', 'text-button', 'Remove');
           remove.type = 'button';
@@ -1196,6 +1205,7 @@
           item.append(name, element('span', 'mod-size', mod.size >= 1048576 ? `${(mod.size / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(mod.size / 1024))} KB`), remove);
           return item;
         }));
+        if (!filtered.length) $(`${kind}-mods`).append(element('li', 'field-help', query ? 'No installed mods match this search.' : 'No mods installed in this section yet.'));
       }
     }
     for (const button of document.querySelectorAll('.mod-list button')) button.disabled = !editable;
@@ -1418,6 +1428,10 @@
       }));
     }
     for (const button of $('friend-list').querySelectorAll('[data-remove-friend]')) button.disabled = !bridgeReady || isBusy();
+    const verifiedMember = !friendError && !friendsLoading && friends?.members?.some(member => member.you === true && member.fingerprint === state?.deviceId);
+    window.seedDashboard.updateGroupMembership({ id: state?.server?.id, fingerprint: state?.relay?.fingerprint,
+      owner: Boolean(verifiedMember && friends.canManage === true && friends.owner === state.deviceId),
+      member: Boolean(verifiedMember && friends.canManage === false && friends.owner !== state.deviceId) });
   }
   window.addEventListener('seedhost-notification-open', async event => {
     if (event.detail?.destination !== 'server') {
@@ -1490,11 +1504,11 @@
       const pendingPark = ownership?.state === 'offered' && ownership.offer?.target === relay.fingerprint;
       $('park-relay').textContent = pendingPark ? 'Retry hand-off' : 'Hand off to always-on PC';
       $('park-relay').disabled = blocked || !server || !isStopped() || !(ownsServer() || pendingPark);
-      $('claim-relay').disabled = blocked || !isStopped() || here || isHosting();
+
       $('check-relay').disabled = blocked;
       $('relay-help').textContent = relayStatusError ? `Couldn’t reach the always-on PC: ${relayStatusError}`
-        : !server ? 'No world on this PC yet. Use Take over hosting to get it from the always-on PC.'
-        : atRelay ? 'The world is waiting on the always-on PC. Anyone in the group can take over hosting, including you.'
+        : !server ? 'No world on this PC yet. Use the group’s Start server action in Friends to sync it and host here.'
+        : atRelay ? 'The world is waiting on the always-on PC. Press Start server to sync it and host here safely.'
         : here && ownership?.state === 'uncertain' ? 'No server process is tracked here. Confirm previous processes are stopped & recover local ownership on Performance before starting.'
         : ownership?.state === 'offered' ? 'A hand-over is pending. Hosting has not been confirmed; check its status before retrying.'
         : here && ['owned', 'hosting'].includes(ownership?.state) ? server.state === 'running' ? 'This PC is running the server. Stop it before handing the world off.' : 'This PC owns the stopped world. Start it here, or hand it off to the always-on PC.'
@@ -1669,7 +1683,7 @@
   }
   $('check-relay').addEventListener('click', () => { if (!$('check-relay').disabled) void checkRelay(); });
   $('relay-join-copy').addEventListener('click', () => { void copyRelayJoin(); });
-  for (const [id, method] of [['park-relay', 'parkAtRelay'], ['claim-relay', 'claimFromRelay']]) {
+  for (const [id, method] of [['park-relay', 'parkAtRelay']]) {
     $(id).addEventListener('click', async () => {
       if ($(id).disabled) return;
       await runAction(method);

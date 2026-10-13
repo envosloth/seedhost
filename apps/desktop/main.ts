@@ -212,6 +212,7 @@ if(!app.requestSingleInstanceLock()){app.quit();}else{
         case 'accountFriendAccept':return accounts.socialAccept(p.id);
         case 'accountFriendDecline':return accounts.socialDecline(p.id);
         case 'accountFriendRemove':return accounts.socialRemove(p.username);
+        case 'leaveGroup':return backend.leaveGroup(p.id,p.fingerprint);
         case 'disbandGroup':{
           const epoch=publicSelectionEpoch,state=await backend.getState();
           if(!state.server||state.server.id!==p.id||state.relay?.fingerprint!==p.fingerprint)throw new Error('The selected server or group changed. Refresh before continuing.');

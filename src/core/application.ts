@@ -3,7 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { TLSSocket } from 'node:tls';
 import { defaultSettings, validateSettings, type Settings } from './settings.js';
-import { importServer, createSnapshot, materializeSnapshot, readSnapshot, pruneStore, syncDirectory, type SnapshotManifest } from './snapshots.js';
+import { importServer, createSnapshot, materializeSnapshot, readSnapshot, pruneStore, pruneBackupHistory, syncDirectory, type SnapshotManifest } from './snapshots.js';
 import { ServerProcess } from './launcher.js';
 import { preflightMinecraftPort } from './port-preflight.js';
 import { readAdmission, saveAdmission, type AdmissionJournal } from './recovery-journal.js';
@@ -14,7 +14,7 @@ import { addMods, exportClientPack, modsDirectory, ordinaryDirectory, removeMod,
 import { ModrinthClient, assertModTarget, isGameVersion, isModLoader, isProjectKey, type ModSort } from './modrinth.js';
 import { indexedMods, modTarget, readModIndex, writeModIndex, type ModVerificationCache } from './mod-index.js';
 import { installMod, assertModInstallComplete, type InstallModInput } from './mod-install.js';
-import { openRelayOperation, relayRequest, relayStatus, relayInitialPublish, relayHostState, relayWithdrawOffer, relayRecoveryStatus, openRelayHostSession, relayInvite, relayInviteFor, relayRemoveFriend, relayFriends, relayDisbandGroup, relayDisbandStatus, joinRelayInvite, validHostEndpoint, type RelayStatus, relayPublic, type RelayHostSession } from './relay-client.js';
+import { openRelayOperation, relayRequest, relayStatus, relayInitialPublish, relayHostState, relayWithdrawOffer, relayRecoveryStatus, openRelayHostSession, relayInvite, relayInviteFor, relayRemoveFriend, relayFriends, relaySetServerName, relayDisbandGroup, relayDisbandStatus, relayLeaveGroup, joinRelayInvite, validHostEndpoint, type RelayStatus, relayPublic, type RelayHostSession } from './relay-client.js';
 import { decodeInvite, type Invite } from './invites.js';
 import { friendName, fingerprintOK } from './relay-friends-store.js';
 import { initializeOnboardingScope, readOnboarding, saveOnboarding, validateOnboarding, onboardingChecks, type SetupConfiguration } from './onboarding.js';
@@ -378,6 +378,30 @@ export class SeedHostApplication {
       } catch { /* an unreadable ledger keeps its recorded revision, nothing more is assumed */ }
     }
     return [...new Set(keep)];
+  }
+
+  /** Best-effort only AFTER durable snapshot + ledger + library publication, inside the operation lock. */
+  private async retainCompletedBackup(server: SavedServer): Promise<void> {
+    try {
+      if (this.saved.activation || this.saved.pendingGroups.length) throw new Error('Pending claim or activation requires retained recovery evidence');
+      const keep: string[] = [];
+      const sameStore = (a: string, b: string) => process.platform === 'win32'
+        ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+      for (const entry of this.saved.servers) {
+        if (!sameStore(entry.storeDir, server.storeDir)) continue;
+        const state = await new OwnershipLedger(entry.ledgerFile, this.identity.fingerprint).status();
+        if (!['owned', 'transferred'].includes(state.state) || state.offer) throw new Error('Ownership or pending offer is unresolved');
+        if (entry === server && state.snapshotId !== server.snapshotId) throw new Error('Backup metadata is not reconciled');
+        const journal = await readAdmission(this.root, entry.id);
+        if (journal && !['stopped', 'cancelled'].includes(journal.phase)) throw new Error('Hosting recovery journal is unresolved');
+        // The completed revision is protected as `latest`; its own predecessor stays replaceable.
+        if (entry !== server) keep.push(entry.snapshotId, state.snapshotId);
+      }
+      const result = await pruneBackupHistory(server.storeDir, server.snapshotId, [...new Set(keep)]);
+      this.log(`Automatic backup retention removed ${result.snapshotsRemoved} old revision(s), ${result.objectsRemoved} unused object(s), ${result.bytesFreed} bytes freed. Operational/conflict copies are retained.`);
+    } catch (error) {
+      this.log('Backup saved; automatic retention deferred: ' + String((error as Error).message));
+    }
   }
 
   /** Choose which server the app operates on. Custody that is still owed elsewhere is never hidden by switching. */
@@ -1182,6 +1206,7 @@ export class SeedHostApplication {
         this.busy = 'stopServer: retrying publication';
         await this.finishGroupHostReservation(server.id);
         await this.park();
+        await this.retainCompletedBackup(server);
         return;
       }
       await this.closeGameGateway();
@@ -1213,6 +1238,7 @@ export class SeedHostApplication {
         await this.finishGroupHostReservation(server.id);
         await this.park();
       }
+      await this.retainCompletedBackup(server);
   }
 
   async createSnapshot(): Promise<void> {
@@ -1229,6 +1255,7 @@ export class SeedHostApplication {
       server.snapshotId = snapshot.id;
       await this.persist();
       this.log('Verified snapshot ' + snapshot.id);
+      await this.retainCompletedBackup(server);
     });
   }
 
@@ -1688,6 +1715,37 @@ export class SeedHostApplication {
     return this.operation('createInviteFor', () => relayInviteFor(this.identity, this.requireRelay(), fingerprint));
   }
 
+  /** Self-revocation is authoritative at the pinned relay; local state is cleaned only after durable readback. */
+  async leaveGroup(id: string | null, fingerprint: string) {
+    if (!fingerprintOK(fingerprint)) throw new Error('Invalid hosting group');
+    return this.operation('leaveGroup', async () => {
+      this.assertStopped();
+      const bound = this.saved.servers.filter(server => server.group?.fingerprint === fingerprint);
+      if (bound.length > 1) throw new Error('Another local server uses this group; leave is blocked');
+      const server = id === null ? null : this.selectedServer(id);
+      if (server ? server.group?.fingerprint !== fingerprint : bound.length !== 0 || !this.saved.pendingGroups.some(group => group.fingerprint === fingerprint)) throw new Error('The server or pending group changed; refresh before leaving');
+      if (server) {
+        const custody = await new OwnershipLedger(server.ledgerFile, this.identity.fingerprint).status();
+        if (custody.state !== 'transferred') throw new Error('Stop and publish or hand off this world before leaving; local custody is unresolved');
+      }
+      const peer = this.saved.peers.find(entry => entry.fingerprint === fingerprint);
+      if (!peer) throw new Error('Pinned group relay is unavailable; local membership retained');
+      const previous = server?.group, previousPending = this.saved.pendingGroups;
+      await relayLeaveGroup(this.identity, peer);
+      if (server && (this.selectedServer(id!) !== server || server.group !== previous)) throw new Error('The selected group changed after leave; refresh to finish cleanup');
+      if (server) server.group = null;
+      this.saved.pendingGroups = previousPending.filter(group => group.fingerprint !== fingerprint);
+      try { await this.persist(); }
+      catch (error) {
+        if (server) server.group = previous!;
+        this.saved.pendingGroups = previousPending;
+        throw new Error('Membership was revoked, but local cleanup could not be saved. Retry Leave on this PC.', {cause:error});
+      }
+      if (server) await this.closeGameGateway();
+      return {left:true,serverId:id,fingerprint};
+    });
+  }
+
   async checkGroupDisband(id: string, fingerprint: string) {
     const server = await this.editableServer(id);
     if (server.group?.fingerprint !== fingerprint) throw new Error('The selected server’s group changed. Refresh before continuing.');
@@ -1915,6 +1973,8 @@ export class SeedHostApplication {
     const server = this.activeServer();
     if (!server) throw new Error('Missing peer or imported server');
     const relay = this.isRelay(peer);
+    // Capture the selected server and its title before any await. Hosting members cannot overwrite the owner title.
+    const canonicalName = server.name;
     const target = relay ? 'the relay' : 'the recipient';
     const ledger = this.ledger(), state = await ledger.status();
     let offer: TransferOffer;
@@ -1931,6 +1991,11 @@ export class SeedHostApplication {
       if (relay) {
         const status = await this.reachRelay(peer, 'The server stays on this PC; nothing was changed.');
         if (status && status.pendingStart !== false) throw new Error('Group hosting Start admission is pending or unknown; resolve the exact reservation before Park. Nothing was changed.');
+        // Publish the owner-authored canonical title only after local safety checks and a confirmed
+        // reachable relay, so unreachable relays keep the wrapped refusal above instead of leaking
+        // raw transport errors and local fences stay ahead of any network work.
+        const members = await relayFriends(this.identity, peer);
+        if (members.owner === this.identity.fingerprint) await relaySetServerName(this.identity, peer, canonicalName);
       }
       await assertServerFileTransactionsComplete(server.serverDir);
       const snapshot = await createSnapshot(server.serverDir, server.storeDir, server.snapshotId);
@@ -1999,12 +2064,13 @@ export class SeedHostApplication {
       if (status.state === 'offered' && status.pendingTarget !== me) {
         throw new Error(`The server is pending checkout to ${status.pendingName ?? 'another PC'}; that PC must retry its claim first.`);
       }
+      const canonicalName = (await relayFriends(this.identity, relay)).serverMetadata?.name;
       const socket = await openRelayOperation(this.identity, relay, 'claim');
       let activation: Promise<boolean> | undefined;
       let accepted = false;
       try {
         await receiveSnapshot(socket, relay.fingerprint, path.join(this.root, 'managed', 'store'), async (snapshot, source, offer) => {
-          accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true });
+          accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, canonicalName });
           return accepted;
         });
       } catch (error) {
@@ -2049,12 +2115,13 @@ export class SeedHostApplication {
     if (status.state === 'offered' && status.pendingTarget !== me) {
       throw new Error(`The server is pending checkout to ${status.pendingName ?? 'another PC'}; that PC must retry its claim first.`);
     }
+    const canonicalName = (await relayFriends(this.identity, peer)).serverMetadata?.name;
     const socket = await openRelayOperation(this.identity, peer, 'claim');
     let activation: Promise<boolean> | undefined;
     let accepted = false;
     try {
       await receiveSnapshot(socket, peer.fingerprint, path.join(this.root, 'managed', 'store'), async (snapshot, source, offer) => {
-        accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, appendGroup: group });
+        accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, appendGroup: group, canonicalName });
         return accepted;
       });
     } catch (error) {
@@ -2099,10 +2166,10 @@ export class SeedHostApplication {
    */
   private async considerIncoming(socket: TLSSocket, token: symbol, snapshot: SnapshotManifest, authenticatedSource: string,
     offer: TransferOffer | undefined, track: (activation: Promise<boolean>) => void,
-    { approved = false, appendGroup = null }: { approved?: boolean; appendGroup?: SavedPendingGroup | null } = {}): Promise<boolean> {
+    { approved = false, appendGroup = null, canonicalName }: { approved?: boolean; appendGroup?: SavedPendingGroup | null; canonicalName?: string } = {}): Promise<boolean> {
     this.log('Received verified snapshot ' + snapshot.id + ' from ' + (this.nameOf(authenticatedSource) ?? authenticatedSource) + '. Replication alone does not grant hosting ownership.');
     if (!offer) return false;
-    if (appendGroup) return this.materializeGroupIncoming(socket, token, snapshot, authenticatedSource, offer, track, appendGroup);
+    if (appendGroup) return this.materializeGroupIncoming(socket, token, snapshot, authenticatedSource, offer, track, appendGroup, canonicalName);
     const previous = this.activeServer(), original = JSON.stringify(this.activeServer());
     let originalAuthority: string | undefined;
     if (previous) {
@@ -2154,7 +2221,7 @@ export class SeedHostApplication {
     revalidate();
     const ledgerFile = previous?.ledgerFile ?? path.join(this.root, `ownership-${randomUUID()}.sqlite`);
     const profile = previous ? { ...previous.profile, args: [...previous.profile.args] } : validateLaunchProfile({ executable: '', args: [] }, true);
-    const candidate: SavedServer = { id: previous?.id ?? newServerId(), name: previous?.name ?? 'Received server', serverDir, storeDir, snapshotId: snapshot.id, profile, ledgerFile, group: previous?.group ?? null };
+    const candidate: SavedServer = { id: previous?.id ?? newServerId(), name: previous?.group?.fingerprint === authenticatedSource && canonicalName !== undefined ? canonicalName : previous?.name ?? 'Received server', serverDir, storeDir, snapshotId: snapshot.id, profile, ledgerFile, group: previous?.group ?? null };
     const activation = (async () => {
       let authorityAttempted = false;
       this.replaceActive(candidate);
@@ -2198,7 +2265,7 @@ export class SeedHostApplication {
    * append back, while authority that may have committed is retained for explicit reconciliation.
    */
   private async materializeGroupIncoming(socket: TLSSocket, token: symbol, snapshot: SnapshotManifest, authenticatedSource: string,
-    offer: TransferOffer, track: (activation: Promise<boolean>) => void, group: SavedPendingGroup): Promise<boolean> {
+    offer: TransferOffer, track: (activation: Promise<boolean>) => void, group: SavedPendingGroup, canonicalName?: string): Promise<boolean> {
     // Clicking Claim is this PC's consent; there is no second dialog and no read of the selected world's ledger.
     this.assertStopped();
     const previousActive = this.saved.activeServerId;
@@ -2206,7 +2273,7 @@ export class SeedHostApplication {
     const storeDir = path.join(this.root, 'managed', 'store');
     const serverDir = path.join(this.root, 'managed', 'servers', randomUUID());
     await materializeSnapshot(storeDir, snapshot.id, serverDir);
-    const candidate: SavedServer = { id: newServerId(), name: 'Received server', serverDir, storeDir, snapshotId: snapshot.id,
+    const candidate: SavedServer = { id: newServerId(), name: canonicalName ?? 'Shared server (name unavailable)', serverDir, storeDir, snapshotId: snapshot.id,
       profile: validateLaunchProfile({ executable: '', args: [] }, true), ledgerFile: path.join(this.root, `ownership-${randomUUID()}.sqlite`),
       group: { fingerprint: group.fingerprint, parkOnStop: group.parkOnStop } };
     const assertSession = () => {

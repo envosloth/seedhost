@@ -391,7 +391,7 @@ export interface PruneResult { snapshotsRemoved: number; objectsRemoved: number;
  * surviving revision references. Every manifest is validated first; anything unexpected aborts before deletion.
  * Callers must hold the store exclusively (no concurrent snapshot or transfer).
  */
-export async function pruneStore(storeDir: string, { keep, ancestors = 0 }: { keep: string[]; ancestors?: number }): Promise<PruneResult> {
+export async function pruneStore(storeDir: string, { keep, ancestors = 0, remove }: { keep: string[]; ancestors?: number; remove?: string[] }): Promise<PruneResult> {
   if (!Array.isArray(keep) || !keep.length) throw new Error('Pruning requires at least one revision to keep');
   if (!Number.isInteger(ancestors) || ancestors < 0) throw new RangeError('ancestors must be a non-negative integer');
   await assertSafeStore(storeDir);
@@ -404,11 +404,19 @@ export async function pruneStore(storeDir: string, { keep, ancestors = 0 }: { ke
     manifests.set(id, await loadManifest(store, id));
   }
   const kept = new Set<string>();
+  // Targeted automatic retention never treats unknown/unrelated history as disposable.
+  if (remove) {
+    for (const id of remove) validateId(id);
+    const candidates = new Set(remove);
+    for (const id of manifests.keys()) if (!candidates.has(id)) kept.add(id);
+  }
   for (const id of keep) {
     validateId(id);
     if (!manifests.has(id)) throw Object.assign(new Error(`Kept snapshot is missing: ${id}`), { code: 'ENOENT' });
+    // With an explicit removal set, `keep` is the caller's COMPLETE protected closure; expanding it here
+    // would silently protect the very revisions the caller asked to replace.
     let current: string | null = id;
-    for (let depth = 0; current !== null && manifests.has(current) && depth <= ancestors; depth++) {
+    for (let depth = 0; current !== null && manifests.has(current) && depth <= (remove ? 0 : ancestors); depth++) {
       kept.add(current);
       current = manifests.get(current)!.parentId;
     }
@@ -435,6 +443,56 @@ export async function pruneStore(storeDir: string, { keep, ancestors = 0 }: { ke
   for (const object of objects) { await rm(object.filename); bytesFreed += object.size; }
   if (objects.length) await syncDirectory(objectsDir);
   return { snapshotsRemoved, objectsRemoved: objects.length, bytesFreed };
+}
+
+/** Rolling history only: keep every unrelated revision and every ancestor of a conflict branch.
+ * Caller owns the application operation lock and has verified all custody/journal references. */
+export async function pruneBackupHistory(storeDir: string, latest: string, keep: string[]): Promise<PruneResult> {
+  const current = await readSnapshot(storeDir, latest);
+  // Re-read immutable bytes, including stat-cache hits, before discarding the previous valid copy.
+  for (const file of current.files) {
+    const filename = path.join(storeDir, 'objects', file.hash);
+    const stat = await lstat(filename);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error('Unsafe backup object');
+    const actual = await hashFile(filename);
+    if (actual.hash !== file.hash || actual.size !== file.size) throw new Error('Completed backup object integrity mismatch');
+  }
+  // Candidate replaceable segment: the completed revision's own ordinary lineage (its predecessors).
+  // Explicitly kept revisions (published world, other worlds, custody/journal refs) end the segment,
+  // and an ancestor already removed by an earlier retention cycle is a normal dangling parent link.
+  const chain = new Set<string>();
+  let cursor: string | null = current.parentId;
+  while (cursor && !keep.includes(cursor)) {
+    if (chain.has(cursor) || cursor === latest) throw new Error('Backup history cycle');
+    let manifest: SnapshotManifest;
+    try { manifest = await readSnapshot(storeDir, cursor); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') break; throw error; }
+    chain.add(cursor); cursor = manifest.parentId;
+  }
+  // Nothing is ever deleted except a chain node no surviving line depends on. Unreadable state fails closed.
+  const protectedIds = new Set<string>([...keep, latest]);
+  const protectLine = async (root: string): Promise<void> => {
+    let ancestor: string | null = root;
+    const seen = new Set<string>();
+    while (ancestor) {
+      if (seen.has(ancestor)) throw new Error('Protected backup history cycle');
+      seen.add(ancestor);
+      // Any chain node this surviving revision descends from is a fork point: never replaceable.
+      if (chain.has(ancestor)) protectedIds.add(ancestor);
+      try { ancestor = (await readSnapshot(storeDir, ancestor)).parentId; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') break; throw error; }
+    }
+  };
+  for (const root of keep) await protectLine(root);
+  for (const name of await readdir(path.join(storeDir, 'snapshots'))) {
+    const id = /^([a-f0-9]{64})\.json$/u.exec(name)?.[1];
+    if (!id) throw new Error('Unexpected backup manifest entry');
+    if (id === latest || keep.includes(id) || chain.has(id)) continue;
+    // A surviving tip outside the replaceable segment keeps its whole line, including shared fork points.
+    protectedIds.add(id); await protectLine(id);
+  }
+  const removal = [...chain].filter((candidate) => !protectedIds.has(candidate));
+  return pruneStore(storeDir, { keep: [...protectedIds], remove: removal });
 }
 
 export async function materializeSnapshot(storeDir: string, id: string, destinationDir: string): Promise<void> {

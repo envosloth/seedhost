@@ -11,15 +11,23 @@ async function fixture(t){
  const app=new SeedHostApplication(path.join(root,'profile'),await createIdentity());await app.open();await app.importExisting(source,true);
  t.after(async()=>{await app.close();await rm(root,{recursive:true,force:true});});return {app,root};
 }
-test('real snapshot history lists retained ancestry with current revision',async t=>{
+test('snapshot history lists the bounded current revision; deferred retention keeps ancestry',async t=>{
  const {app}=await fixture(t);const initial=(await app.getState()).server;
  await writeFile(path.join(initial.serverDir,'level.txt'),'second');await app.createSnapshot();
- const rows=await app.listSnapshots();assert.equal(rows.length,2);
- assert.equal(rows[0].current,true);assert.equal(rows[1].id,initial.snapshotId);assert.equal(rows[1].current,false);
- assert.equal(rows[0].fileCount,2);assert.ok(rows[0].bytes>0);
+ // Automatic one-backup retention replaces the ordinary revision only after the new backup is durable.
+ const bounded=await app.listSnapshots();assert.equal(bounded.length,1);
+ assert.equal(bounded[0].current,true);assert.equal(bounded[0].fileCount,2);assert.ok(bounded[0].bytes>0);
+ await assert.rejects(readFile(path.join(initial.storeDir,'snapshots',initial.snapshotId+'.json')),{code:'ENOENT'});
+ // While recovery evidence is required, retention defers and listed ancestry keeps its parent chain.
+ app.saved.pendingGroups.push({fingerprint:'a'.repeat(64),parkOnStop:false,adoptable:false});
+ await writeFile(path.join(initial.serverDir,'level.txt'),'third');await app.createSnapshot();
+ const deferred=await app.listSnapshots();assert.equal(deferred.length,2);
+ assert.equal(deferred[0].current,true);assert.equal(deferred[1].id,deferred[0].parentId);
 });
 test('restore keeps the previous world and safety revision without rewinding authority',async t=>{
  const {app}=await fixture(t);const initial=(await app.getState()).server;
+ // Restore serves retained history; recovery evidence is what keeps a replaced revision listed.
+ app.saved.pendingGroups.push({fingerprint:'a'.repeat(64),parkOnStop:false,adoptable:false});
  await writeFile(path.join(initial.serverDir,'level.txt'),'second');await app.createSnapshot();
  const previous=(await app.getState()).server;
  await app.restoreSnapshot(initial.snapshotId);
@@ -50,5 +58,5 @@ test('restore refuses running, pending ownership, unknown history and interrupte
 test('retention pruning produces a finite available history instead of breaking the history panel',async t=>{
  const {app}=await fixture(t);const server=(await app.getState()).server;
  for(let i=0;i<5;i++){await writeFile(path.join(server.serverDir,'level.txt'),String(i));await app.createSnapshot();}
- await app.cleanUp();const rows=await app.listSnapshots();assert.equal(rows.length,3);assert.equal(rows[0].current,true);
+ await app.cleanUp();const rows=await app.listSnapshots();assert.equal(rows.length,1);assert.equal(rows[0].current,true);
 });

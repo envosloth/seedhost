@@ -4,11 +4,11 @@ import { setTimeout as delay } from 'node:timers/promises';
 import type { TransferPeer } from './transfers.js';
 import { decodeInvite, type CreatedInvite } from './invites.js';
 import { isPrivateEndpointHost } from './endpoints.js';
-import { friendName } from './relay-friends-store.js';
+import { friendName, validateServerMetadata } from './relay-friends-store.js';
 
 /** Relay connections start with one of these frames; `park` and `claim` then run the ordinary transfer protocol. */
 export const RELAY_PROTOCOL_VERSION = 1;
-export type RelayOperation = 'withdraw-offer' | 'recovery-status' | 'status' | 'park' | 'claim' | 'join' | 'invite' | 'friends' | 'gateway-status' | 'game-tunnel' | 'public-status' | 'public-enable' | 'public-disable' | 'remove-friend' | 'invite-for' | 'disband' | 'disband-status' | 'initial-publish' | 'host-start' | 'host-running' | 'host-cancel' | 'host-stopped';
+export type RelayOperation = 'withdraw-offer' | 'recovery-status' | 'status' | 'park' | 'claim' | 'join' | 'invite' | 'friends' | 'gateway-status' | 'game-tunnel' | 'public-status' | 'public-enable' | 'public-disable' | 'remove-friend' | 'invite-for' | 'disband' | 'disband-status' | 'leave' | 'leave-status' | 'initial-publish' | 'host-start' | 'host-running' | 'host-cancel' | 'host-stopped' | 'server-metadata';
 export const relayRequest = (op: RelayOperation) => ({ type: 'relay', version: RELAY_PROTOCOL_VERSION, op });
 
 /** The only hostnames this app's public addresses take; shared by the relay store and its clients. */
@@ -33,6 +33,7 @@ export interface RelayCustody {
 export interface RelayStatus extends RelayCustody { ownerName: string | null; pendingName: string | null; /** True only with a current authenticated host control session; null means unknown, never idle. */ hosting: true | null; /** Null for older relays: absence never proves no pending admission. */ pendingStart: boolean | null; /** The verified join address the current host session published, or null. Only meaningful while `hosting` is true. */ holderEndpoint: HostEndpoint | null }
 export type RelayFriendsCustody = 'unknown' | 'parked' | 'pending' | 'held';
 export interface RelayFriends {
+  serverMetadata?: { owner: string; name: string };
   canManage: boolean;
   owner: string | null;
   members: { name: string; fingerprint: string; you: boolean }[];
@@ -123,7 +124,17 @@ export async function relayFriends(identity: PeerIdentity, relay: RelayPeer): Pr
   const owner = reply.owner ?? null;
   if (owner !== null && (!hex(owner) || !members.some(m => m.fingerprint === owner))) throw new Error('Invalid group owner');
   if (reply.canManage === true && owner !== identity.fingerprint) throw new Error('Invalid group permissions');
-  return { members, canManage: reply.canManage === true, owner: owner as string | null, custody: reply.custody as RelayFriendsCustody, holder: reply.holder === null ? null : friendName(reply.holder, 100) };
+  const metadata = reply.serverMetadata === undefined ? {} : { serverMetadata: validateServerMetadata(reply.serverMetadata, owner) };
+  return { ...metadata, members, canManage: reply.canManage === true, owner: owner as string | null, custody: reply.custody as RelayFriendsCustody, holder: reply.holder === null ? null : friendName(reply.holder, 100) };
+}
+
+/** Appointed owner only. Durable pinned-authority readback precedes success. */
+export async function relaySetServerName(identity: PeerIdentity, relay: RelayPeer, name: string): Promise<void> {
+  const metadata = validateServerMetadata({ owner: identity.fingerprint, name }, identity.fingerprint);
+  const reply = await friendRequest(identity, relay, { ...relayRequest('server-metadata'), metadata });
+  if (Object.keys(reply).join(',') !== 'type' || reply.type !== 'relay-metadata-saved') throw new Error('Invalid server metadata acknowledgment');
+  const readback = await relayFriends(identity, relay);
+  if (readback.serverMetadata?.owner !== identity.fingerprint || readback.serverMetadata.name !== name) throw new Error('Canonical server name could not be verified');
 }
 
 export async function relayDisbandStatus(identity: PeerIdentity, relay: RelayPeer): Promise<{disbanded: boolean}> {
@@ -135,6 +146,25 @@ export async function relayDisbandStatus(identity: PeerIdentity, relay: RelayPee
 export async function relayDisbandGroup(identity: PeerIdentity, relay: RelayPeer): Promise<void> {
   const reply = await friendRequest(identity, relay, relayRequest('disband'));
   if (Object.keys(reply).sort().join(',') !== 'owner,type' || reply.type !== 'relay-disbanded' || reply.owner !== identity.fingerprint || !(await relayDisbandStatus(identity, relay)).disbanded) throw new Error('Group may have been disbanded, but revocation could not be verified. Check status before retrying.');
+}
+
+export async function relayLeaveStatus(identity: PeerIdentity, relay: RelayPeer): Promise<{left: boolean}> {
+  const reply = await friendRequest(identity, relay, relayRequest('leave-status'));
+  if (Object.keys(reply).sort().join(',') !== 'fingerprint,left,type' || reply.type !== 'relay-leave-status' || reply.fingerprint !== identity.fingerprint || typeof reply.left !== 'boolean') throw new Error('Member leave could not be verified');
+  return {left: reply.left};
+}
+
+export async function relayLeaveGroup(identity: PeerIdentity, relay: RelayPeer): Promise<void> {
+  let failure: unknown;
+  try {
+    const reply = await friendRequest(identity, relay, relayRequest('leave'));
+    if (Object.keys(reply).sort().join(',') !== 'fingerprint,type' || reply.type !== 'relay-left' || reply.fingerprint !== identity.fingerprint) throw new Error('Invalid leave acknowledgement');
+  } catch (error) { failure = error; }
+  // An acknowledgement is not authority. Only this certificate's durable receipt permits local cleanup.
+  let status;
+  try { status = await relayLeaveStatus(identity, relay); }
+  catch (error) { throw new Error('Leave was not verified. Retain the local group and retry on this PC when the relay is online.', {cause: failure ?? error}); }
+  if (!status.left) throw failure ?? new Error('Member leave could not be verified; local association retained');
 }
 
 export async function relayRemoveFriend(identity: PeerIdentity, relay: RelayPeer, fingerprint: string): Promise<void> {

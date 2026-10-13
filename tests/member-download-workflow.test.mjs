@@ -248,7 +248,7 @@ test('lost live-host observation after admitted spawn stays unknown without stra
   await owner.parkAtRelay();
   let connections = 0; const sockets = new Set();
   const proxy = createServer(client => {
-    if (++connections === 5) { client.destroy(); return; } // Only post-spawn host-running telemetry is disconnected.
+    if (++connections === 6) { client.destroy(); return; } // Only post-spawn host-running telemetry is disconnected (status, claim status, canonical-title readback, claim, host-start admission, then telemetry).
     const upstream = connect(relay.endpoint.port, '127.0.0.1');
     for (const socket of [client, upstream]) { sockets.add(socket); socket.on('error', () => {}); socket.on('close', () => sockets.delete(socket)); }
     client.pipe(upstream); upstream.pipe(client);

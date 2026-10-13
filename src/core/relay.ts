@@ -10,7 +10,7 @@ import { RELAY_PROTOCOL_VERSION, validHostEndpoint, type HostEndpoint, type Rela
 import { encodeInvite, type CreatedInvite } from './invites.js';
 import { RelayGameGateway, type GameRoute, type GameGatewayOptions } from './game-gateway.js';
 import type { PublicAddress } from './public-address.js';
-import { durableJSON, fingerprintOK, friendName, readRelayConfig, validAdvertise, withRelayLock,
+import { durableJSON, fingerprintOK, friendName, validateServerMetadata, readRelayConfig, validAdvertise, withRelayLock,
   type FriendMember, type PendingInvite, type RelayConfig } from './relay-friends-store.js';
 
 export interface RelayOptions {
@@ -143,13 +143,14 @@ export class RelayNode {
       if (config.disbandedBy) throw new Error('This group is permanently disbanded; its identity cannot be reused');
       if (config.trusted.length >= 200 && !config.trusted.some((entry) => entry.fingerprint === fingerprint)) throw new Error('Relay friend limit reached');
       config.trusted = [...config.trusted.filter((host) => host.fingerprint !== fingerprint), { name: memberName, fingerprint }];
+      config.leftMembers = (config.leftMembers ?? []).filter(id => id !== fingerprint);
     });
   }
 
   /** Local administration only; the wire protocol has no appoint-owner operation. */
   async setOwner(fingerprint: string): Promise<void> {
     if (!fingerprintOK(fingerprint)) throw new Error('Invalid owner');
-    await this.mutate(async config => { this.requireMember(fingerprint, config); config.owner = fingerprint; });
+    await this.mutate(async config => { this.requireMember(fingerprint, config); if (config.owner !== fingerprint) delete config.serverMetadata; config.owner = fingerprint; });
   }
 
   /** Permanent group-wide revocation, serialized with park/claim. Retains every world revision and ledger. */
@@ -165,6 +166,25 @@ export class RelayNode {
       config.redeemed = {};
       config.memberInvites = false;
       delete config.owner;
+    }));
+    this.queue = run.catch(() => {});
+    await run;
+    await this.game?.validate();
+  }
+
+  async leaveGroup(source: string): Promise<void> {
+    const run = this.queue.then(() => this.mutate(async config => {
+      if (config.leftMembers?.includes(source)) return;
+      this.requireMember(source, config);
+      if (config.owner === source) throw new Error('The group owner cannot leave; hand back the world and disband instead');
+      await this.requireNoPendingStart();
+      const observation = await this.hostObservation();
+      if (observation?.owner === source && observation.state === 'hosting') throw new Error('Stop and publish the world before leaving; hosting is unresolved');
+      const custody = await this.custody();
+      if (custody && (custody.owner === source || custody.state === 'offered' || custody.pendingTarget)) throw new Error('Stop and publish or hand off the latest world and finish pending handoffs before leaving');
+      config.trusted = config.trusted.filter(member => member.fingerprint !== source);
+      config.leftMembers = [...(config.leftMembers ?? []), source];
+      await this.removeInvites(record => record.issuer === source || record.recipient === source);
     }));
     this.queue = run.catch(() => {});
     await run;
@@ -329,6 +349,7 @@ export class RelayNode {
       if (record.issuer !== null && ((!config.memberInvites && config.owner !== record.issuer) || !config.trusted.some((entry) => entry.fingerprint === record.issuer))) throw new Error('Invite has been revoked');
       if (config.trusted.length >= 200 && !config.trusted.some((entry) => entry.fingerprint === source)) throw new Error('Relay friend limit reached');
       config.trusted = [...config.trusted.filter((host) => host.fingerprint !== source), { name: memberName, fingerprint: source }];
+      config.leftMembers = (config.leftMembers ?? []).filter(id => id !== source);
       config.redeemed = { ...config.redeemed, [hash]: { fingerprint: source, expiresAt: record.expiresAt } };
     });
     // Receipt + membership were committed atomically before deletion; a crash here is still single-use.
@@ -345,7 +366,7 @@ export class RelayNode {
       (socket, source) => { void this.handle(socket, source); }, { host, port, authorizeCertificate: async (source) => {
         await this.reload();
         if (this.config.disbandedBy) return this.config.disbandedBy === source ? 'trusted' : false;
-        if (this.config.trusted.some((entry) => entry.fingerprint === source)) return 'trusted';
+        if (this.config.trusted.some((entry) => entry.fingerprint === source) || this.config.leftMembers?.includes(source)) return 'trusted';
         // Retained unexpired receipts allow a bounded bootstrap socket to return an
         // explicit used-token refusal. This never grants membership: handle() still
         // restricts bootstrap sockets to join, and redeemInvite binds receipt reuse
@@ -430,8 +451,8 @@ export class RelayNode {
     let retained = false;
     try {
       const request = await readInviteFrame(socket, 4096, REQUEST_TIMEOUT_MS) as Record<string, unknown>;
-      if (!request || request.type !== 'relay' || request.version !== RELAY_PROTOCOL_VERSION || !['withdraw-offer', 'recovery-status', 'status', 'park', 'claim', 'join', 'invite', 'friends', 'gateway-status', 'game-tunnel', 'public-status', 'public-enable', 'public-disable', 'remove-friend', 'invite-for', 'disband', 'disband-status', 'initial-publish', 'host-start', 'host-running', 'host-cancel', 'host-stopped'].includes(request.op as string) ||
-          Object.keys(request).length !== (['host-start', 'host-running', 'host-cancel', 'host-stopped'].includes(request.op as string) ? 7 : request.op === 'join' || request.op === 'game-tunnel' ? 5 : request.op === 'withdraw-offer' || request.op === 'remove-friend' || request.op === 'invite-for' ? 4 : 3)) {
+      if (!request || request.type !== 'relay' || request.version !== RELAY_PROTOCOL_VERSION || !['withdraw-offer', 'recovery-status', 'status', 'park', 'claim', 'join', 'invite', 'friends', 'gateway-status', 'game-tunnel', 'public-status', 'public-enable', 'public-disable', 'remove-friend', 'invite-for', 'disband', 'disband-status', 'leave', 'leave-status', 'initial-publish', 'host-start', 'host-running', 'host-cancel', 'host-stopped', 'server-metadata'].includes(request.op as string) ||
+          Object.keys(request).length !== (['host-start', 'host-running', 'host-cancel', 'host-stopped'].includes(request.op as string) ? 7 : request.op === 'join' || request.op === 'game-tunnel' ? 5 : request.op === 'withdraw-offer' || request.op === 'remove-friend' || request.op === 'invite-for' || request.op === 'server-metadata' ? 4 : 3)) {
         throw new Error('Unsupported relay request; both ends must run the same SeedHost alpha');
       }
       if (request.op === 'join') {
@@ -447,7 +468,26 @@ export class RelayNode {
         await writeFrame(socket, { type: 'relay-disband-status', disbanded: this.config.disbandedBy === source, owner: source });
         return;
       }
+      if (request.op === 'leave-status') {
+        if (!this.config.leftMembers?.includes(source)) this.requireMember(source);
+        await writeFrame(socket, { type: 'relay-leave-status', fingerprint: source, left: this.config.leftMembers?.includes(source) === true });
+        return;
+      }
+      if (request.op === 'leave') {
+        await this.leaveGroup(source);
+        await writeFrame(socket, { type: 'relay-left', fingerprint: source });
+        return;
+      }
       this.requireMember(source);
+      if (request.op === 'server-metadata') {
+        await this.mutate(async config => {
+          this.requireMember(source, config);
+          if (config.owner !== source) throw new Error('Only the appointed group owner can set the server name');
+          config.serverMetadata = validateServerMetadata(request.metadata, source);
+        });
+        await writeFrame(socket, { type: 'relay-metadata-saved' });
+        return;
+      }
       if (request.op === 'withdraw-offer') {
         const result = await withRelayLock(this.root, async () => {
           await this.reload(); this.requireMember(source);
@@ -577,7 +617,8 @@ export class RelayNode {
         const custody = await this.custody();
         await writeFrame(socket, { type: 'relay-friends', canManage: this.config.owner === source, owner: this.config.owner ?? null, members: this.config.trusted.map((member) => ({ ...member, you: member.fingerprint === source })),
           custody: !custody ? 'unknown' : custody.state === 'owned' ? 'parked' : custody.state === 'offered' ? 'pending' : 'held',
-          holder: custody?.state === 'transferred' ? this.nameOf(custody.owner) : null });
+          holder: custody?.state === 'transferred' ? this.nameOf(custody.owner) : null,
+          ...(this.config.serverMetadata ? { serverMetadata: this.config.serverMetadata } : {}) });
         return;
       }
       if (request.op === 'status') {

@@ -8,14 +8,15 @@ test('fresh empty state has exact centered create action and resumable optional 
   assert.equal(await page.locator('#create-server-empty').textContent(), 'create a server');
   assert.equal(await page.locator('#setup-dialog').isVisible(), true);
   await page.locator('#setup-name').fill('Saved draft');
+  // Selecting a stage explicitly saves progress; Escape on an uncreated setup only cancels the dialog.
+  await page.locator('[data-setup-step="server"]').click(); await settled(page);
   await page.locator('#setup-dialog').press('Escape');
   await page.waitForFunction(() => !document.querySelector('#setup-dialog').open);
   const saved = await page.evaluate(() => window.fixture.state.onboarding);
-  assert.equal(saved.draft.name, 'Saved draft'); assert.equal(saved.dismissed, true);
+  assert.equal(saved.draft.name, 'Saved draft'); assert.equal(saved.dismissed, false, 'cancel does not pretend a dismissal was saved');
   // A new test-only bridge boot uses the saved contract (real durability belongs to the live tool).
   const reopened = await renderer(t, { ...appState(), onboarding: saved });
-  assert.equal(await reopened.locator('#setup-dialog').isVisible(), false);
-  await reopened.locator('#nav-setup').click();
+  await reopened.waitForFunction(() => document.querySelector('#setup-dialog').open);
   assert.equal(await reopened.locator('#setup-name').inputValue(), 'Saved draft');
   assert.equal(await page.locator('#mod-search-form').count(), 1);
   assert.equal(await page.locator('#friend-add-form').count(), 1, 'the ordinary add-by-username form is present without a group');

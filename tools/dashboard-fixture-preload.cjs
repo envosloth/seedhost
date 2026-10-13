@@ -84,7 +84,7 @@ contextBridge.exposeInMainWorld('seedhost', { call: async (method, payload) => {
   }
   if (method === 'listSnapshots') return [{ id: fixture.state.server.id + '-backup', current: true, bytes: 1024, fileCount: 2 }];
   if (method === 'createSnapshot') fixture.state.server.snapshotId += '-new';
-  if (method === 'listFriends') return { members: [], custody: 'unknown', holder: null };
+  if (method === 'listFriends') return clone(fixture.friends ?? (fixture.state.relay ? { members: [{name:'Fixture owner',fingerprint:fixture.state.deviceId,you:true}],canManage:true,owner:fixture.state.deviceId,custody:'unknown',holder:null } : { members: [], custody: 'unknown', holder: null }));
   if (method === 'publicAddressStatus') return { state: 'off', address: null, detail: 'needs-always-on' };
   if (method === 'playitStatus') return { state: 'unconnected' };
   if (method === 'alwaysOnStatus') return { running: false };
@@ -98,6 +98,15 @@ contextBridge.exposeInMainWorld('seedhost', { call: async (method, payload) => {
     return base;
   }
   if (method === 'managePlayer') { const d = fixture.dashboard[payload.id]; if (payload.action === 'kick') { d.players.sample = d.players.sample.filter(p => p.name !== payload.name); d.players.online = d.players.sample.length; } }
+  if (method === 'leaveGroup') {
+    if (!fixture.leaveReadbackMismatch) {
+      fixture.state.server.group = null;
+      fixture.state.relay = null;
+      fixture.state.pendingGroups = (fixture.state.pendingGroups ?? []).filter(group=>group.fingerprint!==payload.fingerprint);
+      for (const entry of fixture.state.servers) if(entry.id===payload.id) entry.group = null;
+    }
+    return {left:true,serverId:payload.id,fingerprint:payload.fingerprint};
+  }
   if (method === 'disbandGroup') {
     const target=fixture.state;
     if (fixture.holdGroupOp) {fixture.groupHeld=true;await new Promise(resolve=>{fixture.heldGroup={resolve};});}

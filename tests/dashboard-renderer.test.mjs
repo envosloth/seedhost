@@ -224,7 +224,7 @@ test('failed local uncertain ownership requires recovery, never self-takeover or
   assert.equal(await page.locator('#recover-ownership').isVisible(), true);
   assert.equal(await page.locator('#recover-ownership').isEnabled(), true);
   await click('#peers-tab');
-  assert.equal(await page.locator('#claim-relay').isDisabled(), true);
+  assert.equal(await page.locator('#claim-relay').count(), 0, 'no self-takeover action exists; explicit stopped-process recovery remains available');
   assert.doesNotMatch(await page.locator('#relay-help').textContent(), /is hosting|take over/i);
   assert.match(await page.locator('#relay-help').textContent(), /No server process is tracked here.*Confirm previous processes are stopped.*recover/i);
   for (const state of ['unknown', 'transferred', 'offered']) {

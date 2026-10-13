@@ -90,10 +90,12 @@ test('New server opens a fresh guide instead of borrowing the selected world', a
   assert.deepEqual(await page.evaluate(()=>window.fixture.state.onboarding),finished);
 });
 
-test('saving a new-world draft preserves the selected world guide and resumes independently', async t => {
+test('explicitly saving a new-world draft preserves the selected world guide and resumes independently', async t => {
   const existing=server(),finished={...progress('ready'),dismissed:true,completed:true,skipped:['friends','gateway']};
   const page=await renderer(t,appState(existing,{onboarding:finished,newServerOnboarding:progress()}));
   await page.locator('#add-server').click();await page.locator('#setup-name').fill('A second world');
+  // Selecting a stage explicitly saves progress; X alone cancels an uncreated setup.
+  await page.locator('[data-setup-step="server"]').click();await settled(page);
   await page.locator('#setup-save-close').click();await page.waitForFunction(()=>!document.querySelector('#setup-dialog').open);
   assert.deepEqual(await page.evaluate(()=>window.fixture.state.onboarding),finished);
   assert.equal(await page.evaluate(()=>window.fixture.calls.find(c=>c.method==='saveOnboarding').payload.serverId),null);
@@ -242,7 +244,8 @@ test('first gateway start explains the one-time hand-off in plain words', async 
   const text = await page.locator('#player-gateway').textContent();
   assert.doesNotMatch(text, /Park and Claim|custody/);
   assert.match(text, /Stop server/);
-  assert.match(text, /Take over hosting/);
+  assert.match(text, /Start server/);
+  assert.doesNotMatch(text, /Take over hosting/);
 });
 
 for (const scenario of ['other group result','round trip result','same pin new endpoint','old error','newer request wins','cached status cleared'])

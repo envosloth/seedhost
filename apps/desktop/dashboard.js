@@ -162,7 +162,36 @@
   const multiScope = el('p', 'field-help multi-host-scope', 'The selected server’s hosting group is shown here. Membership, invitations and world handoffs use that group, not an unrelated server’s group. Account friendships and this PC’s optional always-on role are app-wide. Disband revokes the entire selected group, not just its local association.'); multiScope.id = 'multi-host-scope';
   multiBody.querySelector('.page-header').after(multiScope, $('relay-card'));
   const groupDanger = el('section', 'card dashboard-card'); groupDanger.innerHTML = '<h2>Disband hosting group</h2><p class="field-help">Group-wide revocation requires the group owner, an online updated relay, and this stopped world safely owned here. Older relays cannot verify disbanding; this never substitutes a local disconnect. Every member and outstanding invitation loses group access. Worlds, backups, accounts, friendships and Playit routes are kept; copies already held elsewhere cannot be erased. This group identity cannot be reused.</p><button id="disband-group" type="button" class="button button-danger">Disband group…</button><p id="disband-feedback" class="field-help" role="status"></p>'; multiBody.append(groupDanger);
-  function renderGroupActions() { $('disband-group').disabled = !stoppedOwned() || !state?.relay?.fingerprint; }
+  let groupMembership = null;
+  function updateGroupMembership(value) { groupMembership = value; renderGroupActions(); }
+  const leave = button('Leave group', 'button'); leave.id = 'leave-group'; leave.hidden = true; $('disband-group').before(leave);
+  const ownerGroupHelp = groupDanger.querySelector('.field-help').textContent;
+  function renderGroupActions() {
+    const matched = groupMembership?.id === selectedId() && groupMembership?.fingerprint === state?.relay?.fingerprint;
+    const owner = matched && groupMembership.owner === true;
+    const member = matched && groupMembership.member === true;
+    groupDanger.querySelector('h2').textContent = owner ? 'Disband hosting group' : member ? 'Leave hosting group' : 'Hosting group membership';
+    groupDanger.querySelector('.field-help').textContent = owner ? ownerGroupHelp : member ? 'Leave only your membership. Other members, your local world and account friendships stay intact. Stop and publish or hand off the latest world before leaving. The relay must be online to verify removal.' : 'Refresh group members to verify which actions are available to you.';
+    $('disband-group').hidden = !owner;
+    $('disband-group').disabled = !owner || !stoppedOwned() || !state?.relay?.fingerprint;
+    leave.hidden = !member;
+    leave.disabled = !member || blocked || !['offline','failed'].includes(state?.server?.state) || state?.server?.ownership?.state !== 'transferred';
+    leave.title = leave.disabled ? 'Stop and publish or hand off the world before leaving.' : 'Leave this group; keep your local world and account friendships.';
+  }
+  leave.addEventListener('click', async () => {
+    if (leave.disabled) return;
+    const id = selectedId(), fingerprint = state.relay.fingerprint, generation = selectionGeneration;
+    const current = () => selectedId() === id && generation === selectionGeneration;
+    $('disband-feedback').textContent = 'Leaving this group and verifying membership removal…';
+    let result;
+    const ok = await hooks.runAction('leaveGroup', {id,fingerprint}, value => {result=value;});
+    if (!current()) return;
+    if (!ok) { $('disband-feedback').textContent = 'Leave not verified. Keep the local group and retry when the relay is available; stop and publish first if you hold the world.'; return; }
+    const saved = await window.seedhost.call('getState').catch(()=>null);
+    if (!current()) return;
+    const removed = saved?.server?.id === id && saved.server.group === null && saved.relay === null && Array.isArray(saved.pendingGroups) && !saved.pendingGroups.some(group=>group.fingerprint===fingerprint);
+    $('disband-feedback').textContent = result?.left === true && result.serverId === id && result.fingerprint === fingerprint && removed ? 'Verified leave. Your local world and account friendships are kept.' : 'Group removal could not be confirmed. Refresh before retrying.';
+  });
   $('disband-group').addEventListener('click', async () => {
     if ($('disband-group').disabled) return;
     const id = selectedId(), fingerprint = state.relay.fingerprint, generation = selectionGeneration;
@@ -468,5 +497,5 @@
     if (dashboardPages.has(currentPage) && !blocked && !dashboardInFlight && Date.now() - requestedAt >= DASHBOARD_SAMPLE_INTERVAL) void refreshDashboard();
     renderConsole();
   }
-  window.seedDashboard = Object.freeze({ bind, update, renderServers, selectPage, logsFor });
+  window.seedDashboard = Object.freeze({ bind, update, renderServers, selectPage, logsFor, updateGroupMembership });
 })();

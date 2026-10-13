@@ -213,7 +213,7 @@
                 <p id="relay-join-note" class="field-help" hidden></p>
                 <div class="relay-actions">
                   <button id="park-relay" type="button" class="button button-small" disabled>Hand off to always-on PC</button>
-                  <button id="claim-relay" type="button" class="button button-small" disabled>Take over hosting</button>
+
                   <button id="check-relay" type="button" class="text-button" disabled>Check status</button>
                 </div>
               </div>
@@ -228,7 +228,23 @@
             <section id="snapshot-history" class="snapshot-history card" aria-labelledby="snapshot-history-title" hidden><div class="compact-heading"><h3 id="snapshot-history-title">Backups</h3><button id="refresh-snapshots" type="button" class="text-button">Refresh</button></div><p class="field-help">Saved copies of your world, kept locally on this PC — not a remote backup. Restoring never deletes anything: your current world is kept and backed up first.</p><p id="snapshot-history-status" class="field-help" role="status"></p><ul id="snapshot-list" class="snapshot-list" aria-label="Backups"></ul></section>
 
             <section id="mods-details" class="card mods-workspace" aria-label="Mods discovery and installed files">
-              <header class="mods-workspace-head"><h2>Discover mods</h2><span id="mods-summary" class="summary-meta">Server &amp; client</span></header>
+              <header class="mods-workspace-head"><h2>Mods</h2><span id="mods-summary" class="summary-meta">Server &amp; client</span></header>
+              <h2 class="installed-mods-heading">Installed mods <span class="section-caption">Server and player files kept separate</span></h2>
+              <label for="installed-mod-query">Find installed mods</label>
+              <input id="installed-mod-query" type="search" maxlength="200" placeholder="Search installed filenames" autocomplete="off">
+              <div class="mods-panel">
+                <div class="mods-column well">
+                  <div class="compact-heading"><h3>Server mods <span class="section-caption">mods/</span></h3><button id="add-server-mods" type="button" class="button button-small" disabled>Add .jar…</button></div>
+                  <p class="field-help">Loaded by the server on its next start. Players usually need the same mods too.</p>
+                  <ul id="server-mods" class="mod-list" aria-label="Server mods"></ul>
+                </div>
+                <div class="mods-column well">
+                  <div class="compact-heading"><h3>Client pack <span class="section-caption">players only</span></h3><button id="add-client-mods" type="button" class="button button-small" disabled>Add .jar…</button></div>
+                  <p class="field-help">Never loaded by the server. Export a zip for players: shaders, minimaps, and the client side of your modpack.</p>
+                  <ul id="client-mods" class="mod-list" aria-label="Client mods"></ul>
+                  <button id="export-client-pack" type="button" class="button button-small" disabled>Export client pack (.zip)…</button>
+                </div>
+              </div>
               <section id="mod-browser" class="mod-browser" aria-labelledby="mod-browser-heading">
                 <div class="compact-heading"><h3 id="mod-browser-heading">Browse Modrinth</h3><span class="subtle-label">COMPATIBLE MODS</span></div>
                 <p class="field-help">Search compatible mods using the loader and Minecraft version below. Installs include required dependencies and verified download hashes; nothing starts automatically.</p>
@@ -247,20 +263,6 @@
                 <fieldset id="mod-placement-controls" class="mod-placement-controls"><legend>Install placement</legend><p class="field-help">Automatic uses the project’s published server/client requirements. Overrides remain subject to dependency and compatibility checks.</p><div class="chip-options"><label class="chip-option"><input type="radio" name="mod-placement" value="auto" checked><span>Automatic</span></label><label class="chip-option"><input type="radio" name="mod-placement" value="server"><span>Server</span></label><label class="chip-option"><input type="radio" name="mod-placement" value="client"><span>Client pack</span></label><label class="chip-option"><input type="radio" name="mod-placement" value="both"><span>Server + client</span></label></div></fieldset><ul id="mod-results" class="mod-results" aria-label="Compatible Modrinth mods" aria-busy="false"></ul>
                 <div class="mod-pagination"><button id="mod-previous" type="button" class="button button-small" disabled>Previous</button><span id="mod-page" class="field-help">No results loaded</span><button id="mod-next" type="button" class="button button-small" disabled>Next</button></div>
               </section>
-              <h2 class="installed-mods-heading">Installed mods <span class="section-caption">Server and player files kept separate</span></h2>
-              <div class="mods-panel">
-                <div class="mods-column well">
-                  <div class="compact-heading"><h3>Server mods <span class="section-caption">mods/</span></h3><button id="add-server-mods" type="button" class="button button-small" disabled>Add .jar…</button></div>
-                  <p class="field-help">Loaded by the server on its next start. Players usually need the same mods too.</p>
-                  <ul id="server-mods" class="mod-list" aria-label="Server mods"></ul>
-                </div>
-                <div class="mods-column well">
-                  <div class="compact-heading"><h3>Client pack <span class="section-caption">players only</span></h3><button id="add-client-mods" type="button" class="button button-small" disabled>Add .jar…</button></div>
-                  <p class="field-help">Never loaded by the server. Export a zip for players: shaders, minimaps, and the client side of your modpack.</p>
-                  <ul id="client-mods" class="mod-list" aria-label="Client mods"></ul>
-                  <button id="export-client-pack" type="button" class="button button-small" disabled>Export client pack (.zip)…</button>
-                </div>
-              </div>
               <p class="warning-copy mods-warning">Mods run code on every PC that loads them. Only add files you trust.</p>
                           </section>
 
@@ -498,7 +500,7 @@
     </aside>
 
     <div class="setup-main">
-      <header class="setup-header"><div><p class="eyebrow">SETUP GUIDE</p><h2 id="setup-title">Welcome to Seed Hosting</h2></div><button id="setup-save-close" type="button" class="icon-button" aria-label="Close setup guide (progress is saved)" title="Close · your progress is saved">✕</button></header>
+      <header class="setup-header"><div><p class="eyebrow">SETUP GUIDE</p><h2 id="setup-title">Welcome to Seed Hosting</h2></div><button id="setup-save-close" type="button" class="icon-button" aria-label="Close setup guide" title="Close setup guide">✕</button></header>
       <p id="setup-error" class="notice notice-error" role="alert" hidden></p><button id="setup-close-unsaved" type="button" class="text-button" hidden>Close without saving progress</button>
       <div class="setup-body">
         <section id="setup-server" data-setup-panel="server">

@@ -14,8 +14,12 @@ export interface RelayConfig {
   memberInvites?: boolean;
   /** Appointed locally; never inferred from invitation order or the current world holder. */
   owner?: string;
+  /** Canonical world title, appointed-owner-authored; never local aliases or executable settings. */
+  serverMetadata?: { owner: string; name: string };
   /** Permanent revocation tombstone; only this former owner may read disband status. */
   disbandedBy?: string;
+  /** Certificate-bound durable self-leave receipts; never confer group authority. */
+  leftMembers?: string[];
   advertise?: { host: string; port: number };
   /** Token digests only, for same-certificate retry after a lost join response. */
   redeemed?: Record<string, { fingerprint: string; expiresAt: number }>;
@@ -25,6 +29,14 @@ export const fingerprintOK = (value: unknown): value is string => typeof value =
 export function friendName(value: unknown, max = 60): string {
   if (typeof value !== 'string' || !value.trim() || value.length > max || /\p{Cc}/u.test(value)) throw new Error(`Friend name must be 1–${max} characters with no controls`);
   return value.trim();
+}
+export function validateServerMetadata(value: unknown, owner: unknown): { owner: string; name: string } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid server metadata');
+  const row = value as Record<string, unknown>;
+  if (Object.keys(row).sort().join(',') !== 'name,owner' || !fingerprintOK(owner) || row.owner !== owner) throw new Error('Invalid server metadata owner or fields');
+  const name = friendName(row.name, 100);
+  if (name !== row.name) throw new Error('Invalid canonical server name');
+  return { owner, name };
 }
 export function validAdvertise(value: unknown): value is { host: string; port: number } {
   const endpoint = value as { host: string; port: number } | undefined;
@@ -45,6 +57,8 @@ export async function readRelayConfig(root: string, defaultName: string): Promis
         (value.memberInvites !== undefined && typeof value.memberInvites !== 'boolean') ||
         (value.owner !== undefined && (!fingerprintOK(value.owner) || !value.trusted.some(m => m.fingerprint === value.owner))) ||
         (value.disbandedBy !== undefined && (!fingerprintOK(value.disbandedBy) || value.trusted.length !== 0 || value.owner !== undefined)) ||
+        (value.leftMembers !== undefined && (!Array.isArray(value.leftMembers) || value.leftMembers.some(id => !fingerprintOK(id) || value.trusted.some(m => m.fingerprint === id)) || new Set(value.leftMembers).size !== value.leftMembers.length)) ||
+        (value.serverMetadata !== undefined && !validateServerMetadata(value.serverMetadata, value.owner ?? value.disbandedBy)) ||
         (value.advertise !== undefined && !validAdvertise(value.advertise)) ||
         (value.redeemed !== undefined && (!value.redeemed || Array.isArray(value.redeemed) || typeof value.redeemed !== 'object' ||
           Object.entries(value.redeemed).some(([hash, entry]) => !fingerprintOK(hash) || !fingerprintOK(entry?.fingerprint) || !Number.isSafeInteger(entry.expiresAt))))) throw new Error();

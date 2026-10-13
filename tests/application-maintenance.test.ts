@@ -6,7 +6,7 @@ import { createIdentity } from '../src/core/peer-transport.js';
 import { SeedHostApplication } from '../src/core/application.js';
 import { OwnershipLedger } from '../src/core/ownership.js';
 import { validateCall } from '../src/core/ipc-policy.js';
-import { materializeSnapshot } from '../src/core/snapshots.js';
+import { createSnapshot, materializeSnapshot } from '../src/core/snapshots.js';
 
 const fixture = path.resolve('tools/fake-java-server.mjs');
 async function setup(prefix: string) {
@@ -115,12 +115,16 @@ test('cleanup removes old execution directories and unreferenced revisions but k
       await writeFile(path.join(server.serverDir, 'world.bin'), `edit ${i}`);
       await app.createSnapshot();
     }
+    // Automatic retention already keeps only the current revision of ordinary history; cleanup still
+    // has to remove an unreferenced revision, like one left behind by a failed publication.
+    const unreferenced = await createSnapshot(server.serverDir, server.storeDir);
     const stale = path.join(root, 'profile', 'managed', 'servers', 'previous-execution');
     await mkdir(stale, { recursive: true });
     await writeFile(path.join(stale, 'world.bin'), 'old copy');
     const result = await app.cleanUp();
     assert.equal(result.serverDirsRemoved, 1);
     assert.ok(result.snapshotsRemoved >= 1);
+    await assert.rejects(access(path.join(server.storeDir, 'snapshots', unreferenced.id + '.json')), /ENOENT/);
     await assert.rejects(access(stale), /ENOENT/);
     const current = (await app.getState()).server!;
     assert.equal(await readFile(path.join(current.serverDir, 'world.bin'), 'utf8'), 'edit 2');
