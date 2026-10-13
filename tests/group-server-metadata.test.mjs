@@ -7,6 +7,7 @@ import {SeedHostApplication} from '../dist/src/core/application.js';
 import {createIdentity} from '../dist/src/core/peer-transport.js';
 import * as client from '../dist/src/core/relay-client.js';
 import {connectPeer,writeFrame,readFrame} from '../dist/src/core/peer-transport.js';
+import {readRelayConfig} from '../dist/src/core/relay-friends-store.js';
 
 async function raw(identity,peer,request) {
  const socket=await connectPeer(identity,peer.fingerprint,peer.host,peer.port);
@@ -83,4 +84,57 @@ test('real pinned TLS rejects nonowner, untrusted and malformed metadata without
  corrupt=false;await member.claimPendingGroup(peer.fingerprint);await relay.settled();assert.equal((await member.getState()).server.name,'The Owner World');
 });
 
+test('local owner untrust permits restart and a trusted replacement canonical title without resurrecting the former owner',async t=>{
+ const {relay,owner,member,peer}=await fixture(t);
+ const configFile=path.join(relay.root,'relay.json');
+ await relay.trust('ReplacementOwner',member.identity.fingerprint);
+ await client.relaySetServerName(owner.identity,peer,'The Owner World');
+ assert.deepEqual((await readRelayConfig(relay.root,relay.name)).serverMetadata,{owner:owner.identity.fingerprint,name:'The Owner World'});
 
+ await relay.untrust(owner.identity.fingerprint);
+ await relay.reload();
+ const removed=await readRelayConfig(relay.root,relay.name);
+ assert.equal(removed.owner,undefined);assert.equal(removed.serverMetadata,undefined);
+ assert.deepEqual(removed.trusted,[{name:'ReplacementOwner',fingerprint:member.identity.fingerprint}]);
+ assert.equal(relay.owner,undefined);
+
+ await relay.close();
+ const restarted=new RelayNode(relay.root,relay.identity,{log(){}});
+ try {
+  await restarted.open();await restarted.listen();
+  const restartedPeer={fingerprint:peer.fingerprint,...restarted.endpoint};
+  assert.equal(restarted.owner,undefined);
+  const unappointed=await client.relayFriends(member.identity,restartedPeer);
+  assert.equal(unappointed.owner,null);assert.equal(unappointed.serverMetadata,undefined);
+  await assert.rejects(client.relaySetServerName(member.identity,restartedPeer,'Premature title'),/owner/i);
+  await restarted.setOwner(member.identity.fingerprint);
+  await client.relaySetServerName(member.identity,restartedPeer,'Replacement Canonical World');
+  await restarted.reload();
+  const saved=await readRelayConfig(relay.root,restarted.name);
+  assert.equal(saved.owner,member.identity.fingerprint);
+  assert.deepEqual(saved.serverMetadata,{owner:member.identity.fingerprint,name:'Replacement Canonical World'});
+  assert.deepEqual(saved.trusted,removed.trusted);
+  const friends=await client.relayFriends(member.identity,restartedPeer);
+  assert.equal(friends.canManage,true);assert.equal(friends.owner,member.identity.fingerprint);
+  assert.deepEqual(friends.serverMetadata,saved.serverMetadata);
+  assert.equal(friends.members.some(m=>m.fingerprint===owner.identity.fingerprint),false);
+  const before=await readFile(configFile,'utf8');
+  await assert.rejects(client.relayFriends(owner.identity,restartedPeer),/untrusted|denied|refused/i);
+  await assert.rejects(client.relaySetServerName(owner.identity,restartedPeer,'Former owner title'),/untrusted|denied|refused/i);
+  assert.equal(await readFile(configFile,'utf8'),before);
+ } finally {await restarted.close();}
+});
+
+test('local non-owner untrust preserves valid canonical owner metadata',async t=>{
+ const {relay,owner,member,peer}=await fixture(t);
+ await relay.trust('Member',member.identity.fingerprint);
+ await client.relaySetServerName(owner.identity,peer,'The Owner World');
+ const before=await readRelayConfig(relay.root,relay.name);
+ await relay.untrust(member.identity.fingerprint);
+ await relay.reload();
+ const after=await readRelayConfig(relay.root,relay.name);
+ assert.equal(after.owner,owner.identity.fingerprint);
+ assert.deepEqual(after.serverMetadata,before.serverMetadata);
+ assert.deepEqual(after.trusted,[{name:'OwnerUsername',fingerprint:owner.identity.fingerprint}]);
+ assert.deepEqual((await client.relayFriends(owner.identity,peer)).serverMetadata,before.serverMetadata);
+});

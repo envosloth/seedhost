@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.8-alpha
+
+Unsigned portable Windows alpha. Update all participating hosting PCs and the group relay before testing. Keep independent world backups; no automatic installation or live-world migration is performed by publishing this release.
+
+- Installed server and client mods appear first and can be filtered without searching the online catalogue. Discovery, compatibility checks and guarded mod operations remain available.
+- Quick setup's X and Escape cancel an uncreated server instead of forcing creation. Selecting a setup stage explicitly saves draft progress; an in-flight creation remains guarded.
+- Only the hosting-group owner can disband the group. Members can leave with a pinned-relay acknowledgment and durable local readback; failed or uncertain removal is not reported as success.
+- The group owner's canonical server name is published through the pinned relay and used when members download the server. Name publication follows local safety checks and confirmed relay reachability.
+- Local operator revocation of the appointed owner clears owner-authored metadata in the same durable update, allowing a clean relay restart and explicit replacement-owner appointment without restoring the revoked owner.
+- Save backup and successful Stop retain the newest completed ordinary backup automatically. Older ordinary revisions and unused objects are pruned only after the replacement is verified durable. Other worlds, custody references, recovery evidence and conflict branches remain protected; unresolved state defers cleanup, so more than one revision may remain.
+- The Multi-host Take over button and generic hosting-authority warning are removed. Group guidance points to ordinary Start server; exclusive ownership, pending-Start and uncertainty fences remain enforced.
+- The optional always-on player gateway remains the way to share one persistent group address. Automatic per-server Playit setup still requires the provider's first-time account approval; no account-free provider workflow or portable tunnel credential is added.
+
+Known limits: scheduled backup-only jobs, profile-update backups and old materialized server folders are not covered by automatic revision retention. Ordinary replaced revisions no longer appear as restore choices; protected retained history remains available. Public-provider allocation, different-network handover and authenticated Minecraft gameplay are not certified by the automated process/socket tests.
+
 ## 0.6.6-alpha
 
 Unsigned portable Windows alpha. Update both hosting PCs and retain independent world backups.

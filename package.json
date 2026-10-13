@@ -1,6 +1,6 @@
 {
   "name": "seedhost",
-  "version": "0.6.7-alpha",
+  "version": "0.6.8-alpha",
   "private": true,
   "type": "module",
   "main": "dist/apps/desktop/main.js",

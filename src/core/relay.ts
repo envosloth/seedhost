@@ -227,7 +227,10 @@ export class RelayNode {
         throw new Error('This friend has a handoff pending; finish or decline that handoff before removing them');
       }
       config.trusted = config.trusted.filter((host) => host.fingerprint !== fingerprint);
-      if (config.owner === fingerprint) delete config.owner;
+      if (config.owner === fingerprint) {
+        delete config.owner;
+        delete config.serverMetadata;
+      }
       // Keep used-token tombstones: removing a friend must not revive a consumed token after a crash.
       await this.removeInvites((record) => record.issuer === fingerprint || record.recipient === fingerprint);
       config.redeemed = Object.fromEntries(Object.entries(config.redeemed ?? {}).filter(([, receipt]) => receipt.expiresAt > Date.now()));
