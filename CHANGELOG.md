@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased — audit fixes
+
+- The relay's retention now always keeps the revision its custody ledger currently holds, and an accepted retry of an
+  older park is an acknowledgment only. Before this change a replayed retry could prune the authoritative revision, so
+  the group still looked checked out but the next claim failed because the world's manifest was gone. Retention and
+  acceptance now run under the same cross-process lock.
+- The Minecraft port a world actually binds is read with the same Java-properties rules as launch preflight (repeat keys
+  where the last wins, `:`/whitespace separators, escaped keys). Public-tunnel reservations and Start admission were
+  previously given the first simple text match, so a guard could protect a port the server never bound.
+- A library or group list is refused before it would exceed the size the saved-state format accepts. Importing,
+  creating, claiming and joining at the limit now fail with an actionable message instead of persisting a profile the
+  app refuses to reopen on the next launch.
+- ZIP exports continue after a short file write and fail if a write makes no progress, so a client pack can no longer be
+  reported as complete while truncated. `writeZip` still publishes only through a flushed temporary file.
+- A failed Java runtime download cancels its remaining workers and waits for all of them before deleting staging, so no
+  worker can recreate the download folder and keep writing after setup reported failure.
+- The desktop runtime moves to Electron 44.10.1 (patched line for the compromised-intermediate-certificate advisory)
+  and the build tooling pins patched `glob`/`minimatch` through package overrides. Verify the packaged executable's
+  embedded versions before publishing; this entry does not claim a published artifact.
+
 ## Unreleased — failed-checkout recovery
 
 - A recipient that runs out of space before accepting ownership no longer leaves the hosting group permanently reserved to that PC. The relay durably fences and releases proven pre-acceptance failures.

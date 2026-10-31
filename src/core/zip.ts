@@ -41,10 +41,17 @@ export async function writeZip(destination: string, entries: ZipEntry[]): Promis
   let offset = 0;
   const central: Buffer[] = [];
   try {
+    // `FileHandle.write` may legally complete short (quota, antivirus filter, network volume). Advance by the bytes
+    // actually written and fail loudly, so a truncated archive is never renamed into place and reported as success.
     const write = async (buffer: Buffer) => {
       if (offset + buffer.length > MAX_ARCHIVE_BYTES) throw new Error('Client pack exceeds the 4 GiB zip limit');
-      await handle.write(buffer);
-      offset += buffer.length;
+      let written = 0;
+      while (written < buffer.length) {
+        const { bytesWritten } = await handle.write(buffer, written, buffer.length - written);
+        if (!bytesWritten) throw new Error(`Zip write made no progress after ${offset + written} bytes`);
+        written += bytesWritten;
+      }
+      offset += written;
     };
     for (const entry of entries) {
       let data: Buffer, modified: Date;

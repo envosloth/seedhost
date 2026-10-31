@@ -685,6 +685,8 @@ export class RelayNode {
     const ledger = this.ledger();
     await receiveSnapshot(socket, source, this.store, async (snapshot, authenticated, offer) => {
       if (!offer) return false;
+      // Re-acknowledging an exact durable acceptance is a recovery path, not a new park.
+      let replay = false;
       // The membership, lineage and custody decision — including whether an already-accepted offer may be
       // re-acknowledged — commits under the cross-process lock shared with revocation
       // (`untrust`, CLI included) and with claim preparation: a device revoked while its park streamed, or a
@@ -711,6 +713,7 @@ export class RelayNode {
             this.log(`Declined replayed park from ${who}: it does not match the durable acceptance record; explicit operator recovery required.`);
             return false;
           }
+          replay = true;
           return true;
         }
         await this.requireNoPendingStart();
@@ -732,20 +735,42 @@ export class RelayNode {
         return true;
       });
       if (!accepted) return false;
-      // Bookkeeping happens before the acknowledgment, so the host's next request never races it.
-      // It is best-effort: authority has already committed and must not be reported as failed.
-      try {
-        const history = await this.mutate(async (config) => {
-          config.history = [...config.history.filter((id) => id !== snapshot.id), snapshot.id].slice(-this.keepRevisions);
-          return [...config.history];
-        });
-        const pruned = await pruneStore(this.store, { keep: history });
-        this.log(`Parked ${snapshot.id} from ${who}. Pruned ${pruned.snapshotsRemoved} old revision(s).`);
-      } catch (error) {
-        this.log(`Parked ${snapshot.id} from ${who}, but history cleanup failed: ${(error as Error).message}`);
-      }
+      await this.recordParkedRevision(snapshot.id, replay, who);
       return true;
     });
+  }
+
+  /**
+   * Retention bookkeeping for a park the ledger already committed. It runs under the same cross-process lock as
+   * acceptance, claim preparation and revocation so a concurrently parked revision can never be pruned against a
+   * stale keep set. Two invariants keep the group available:
+   * - the revision custody holds NOW is always kept, whatever an earlier retention cycle recorded;
+   * - a replay of an already accepted offer is an acknowledgment only. It never re-enters the rolling history and
+   *   therefore can never promote old revisions over the one custody actually holds.
+   * Cleanup is best effort: authority has already committed and must not be reported as failed.
+   */
+  private async recordParkedRevision(snapshotId: string, replay: boolean, who: string): Promise<void> {
+    try {
+      await withRelayLock(this.root, async () => {
+        const config: RelayNodeConfig = await readRelayConfig(this.root, this.defaultName);
+        if (!replay) config.history = [...config.history.filter((id) => id !== snapshotId), snapshotId].slice(-this.keepRevisions);
+        let custodySnapshot: string | undefined;
+        try { custodySnapshot = (await this.ledger().status()).snapshotId; }
+        catch (error) {
+          // Fail closed: without the durable authority there is no proven revision to prune against.
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        config.redeemed = Object.fromEntries(Object.entries(config.redeemed ?? {}).filter(([, receipt]) => receipt.expiresAt > Date.now()));
+        await durableJSON(path.join(this.root, 'relay.json'), config);
+        this.config = config;
+        const keep = [...new Set([...(custodySnapshot ? [custodySnapshot] : []), ...config.history])];
+        if (!keep.length) return;
+        const pruned = await pruneStore(this.store, { keep });
+        this.log(`Parked ${snapshotId} from ${who}${replay ? ' (already accepted; custody unchanged)' : ''}. Pruned ${pruned.snapshotsRemoved} old revision(s).`);
+      });
+    } catch (error) {
+      this.log(`Parked ${snapshotId} from ${who}, but history cleanup failed: ${(error as Error).message}`);
+    }
   }
 
   /** The relay hands the server to a trusted host, or resends a pending claim to the host it is pending for. */

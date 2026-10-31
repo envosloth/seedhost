@@ -80,6 +80,17 @@ export function readServerProperties(text: string): ServerPropertyPatch {
   return result;
 }
 
+/** The port this file makes the JVM bind. Java properties allow `:`/whitespace separators, escaped keys and repeat
+ * keys where the LAST value wins — a first-match regex would report a port the server never binds. An absent value
+ * keeps Minecraft's documented 25565 default; a malformed one cannot be bound at all, so the caller's default is
+ * display-only and the launch preflight still refuses it. */
+export function effectiveServerPort(text: string): number {
+  const raw = readServerProperties(text)['server-port'] ?? '';
+  if (!/^\d{1,5}$/.test(raw)) return 25565;
+  const port = Number(raw);
+  return port >= 1 && port <= 65535 ? port : 25565;
+}
+
 export function patchServerProperties(text: string, input: unknown): string {
   const patch = validateServerProperties(input);
   const eol = text.includes('\r\n') ? '\r\n' : '\n';

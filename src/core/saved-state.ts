@@ -113,6 +113,10 @@ export function validatePeer(input: unknown): SavedPeer {
 }
 
 export const SERVER_ID_PATTERN = /^[a-f0-9]{32}$/;
+/** Hard bounds of the saved-state format. `open()` refuses files beyond them, so every mutation must respect the
+ * same numbers or it can persist a profile the app will not reopen. Keep both lists bounded in ONE place. */
+export const MAX_LIBRARY_SERVERS = 200;
+export const MAX_PENDING_GROUPS = 20;
 export function newServerId(): string { return randomUUID().replace(/-/g, ''); }
 export function isServerId(value: unknown): value is string { return typeof value === 'string' && SERVER_ID_PATTERN.test(value); }
 
@@ -169,7 +173,7 @@ export function parseSavedState(value: unknown): SavedState {
     if (single === null) { servers = []; activeServerId = null; }
     else { const migrated = validateSavedServer({ ...(isObject(single) ? single : {}), id: newServerId() }, 0, false); servers = [migrated]; activeServerId = migrated.id; }
   } else {
-    if (!Array.isArray(value.servers) || value.servers.length > 200) invalid('servers must be a list');
+    if (!Array.isArray(value.servers) || value.servers.length > MAX_LIBRARY_SERVERS) invalid('servers must be a list');
     servers = value.servers.map((entry, index) => validateSavedServer(entry, index, !legacy));
     if (new Set(servers.map((entry) => entry.id)).size !== servers.length) invalid('server ids must be unique');
     if (value.activeServerId === null || value.activeServerId === undefined) activeServerId = null;
@@ -201,7 +205,7 @@ export function parseSavedState(value: unknown): SavedState {
   } else {
     if (value.pendingGroups !== undefined && !Array.isArray(value.pendingGroups)) invalid('pending hosting groups must be a list');
     pendingGroups = (value.pendingGroups ?? []).map((entry, index) => validatePendingGroup(entry, index));
-    if (pendingGroups.length > 20) invalid('pending hosting groups must be a list');
+    if (pendingGroups.length > MAX_PENDING_GROUPS) invalid('pending hosting groups must be a list');
     if (new Set(pendingGroups.map((entry) => entry.fingerprint)).size !== pendingGroups.length) invalid('pending hosting groups must be unique');
     for (const entry of servers) {
       if (entry.group && !peers.some((peer) => peer.fingerprint === entry.group!.fingerprint)) invalid('a server hosting group is not a trusted peer');

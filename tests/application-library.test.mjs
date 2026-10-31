@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createIdentity } from '../dist/src/core/peer-transport.js';
 import { SeedHostApplication } from '../dist/src/core/application.js';
@@ -234,4 +234,38 @@ test('library IPC accepts only a well-formed server id', () => {
   assert.throws(() => validateCall('selectServer', { id, extra: 1 }, renderer, renderer, trusted));
   assert.throws(() => validateCall('deleteServer', { id: 'a'.repeat(32) + '\n' }, renderer, renderer, trusted));
   assert.throws(() => validateCall('deleteServer', undefined, renderer, renderer, trusted));
+});
+
+/**
+ * Startup refuses a library above the supported size, so a mutation that persists one would make the whole library
+ * unopenable. The refusal must happen before any copy or download work.
+ */
+test('a full library refuses another import without copying or corrupting state', async () => {
+  const { root, profile, app, identity } = await setup('library-capacity-');
+  try {
+    await app.importExisting(await stoppedSource(root, 'seed'), true);
+    await app.close();
+    const file = path.join(profile, 'state.json');
+    const saved = JSON.parse(await readFile(file, 'utf8'));
+    const template = saved.servers[0];
+    // A pre-existing library at the documented maximum (200): valid, openable, and already full.
+    saved.servers = Array.from({ length: 200 }, (_, index) => ({
+      ...template, id: index.toString(16).padStart(32, '0'), name: `world ${index}`,
+      serverDir: path.join(profile, 'managed', 'servers', index.toString(16).padStart(32, '0')),
+    }));
+    saved.activeServerId = saved.servers[saved.servers.length - 1].id;
+    await writeFile(file, JSON.stringify(saved));
+    const reopened = new SeedHostApplication(profile, identity);
+    await reopened.open();
+    try {
+      assert.equal((await reopened.getState()).servers.length, 200);
+      const managed = path.join(profile, 'managed', 'servers');
+      const before = (await readdir(managed)).length;
+      const overflow = await stoppedSource(root, 'overflow');
+      await assert.rejects(reopened.importExisting(overflow, true), /library is full/i);
+      assert.equal((await readdir(managed)).length, before, 'no managed copy is created for a refused import');
+      assert.equal(JSON.parse(await readFile(file, 'utf8')).servers.length, 200, 'refused import never persists');
+      assert.equal(await readFile(path.join(overflow, 'world.bin'), 'utf8'), 'overflow', 'the source folder is untouched');
+    } finally { await reopened.close(); }
+  } finally { await app.close(); await rm(root, { recursive: true, force: true }); }
 });

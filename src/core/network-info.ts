@@ -1,6 +1,7 @@
 import { open } from 'node:fs/promises';
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
+import { effectiveServerPort } from './server-properties.js';
 
 type Interfaces = Record<string, Array<{ address: string; family: string | number; internal: boolean }> | undefined>;
 
@@ -36,8 +37,7 @@ export async function readServerPort(serverDir: string): Promise<number> {
     let text: string;
     try { const buffer = Buffer.alloc(65536); const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0); text = buffer.subarray(0, bytesRead).toString('utf8'); }
     finally { await handle.close(); }
-    const match = /^server-port\s*=\s*(\d{1,5})\s*$/m.exec(text);
-    const port = match ? Number(match[1]) : NaN;
-    return Number.isInteger(port) && port >= 1 && port <= 65535 ? port : 25565;
+    // Same Java-compatible reader as launch preflight: a guard must never be given a port the JVM will not bind.
+    return effectiveServerPort(text);
   } catch { return 25565; }
 }

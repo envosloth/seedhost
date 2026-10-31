@@ -33,6 +33,7 @@ import { createSchedule, readScheduleSnapshot, writeSchedules, validateScheduleI
 import { patchServerProperties, readServerProperties, validateServerProperties } from './server-properties.js';
 import {
   parseSavedState, validateLaunchProfile, validatePeer, validateRelayConfig, newServerId, isServerId,
+  MAX_LIBRARY_SERVERS, MAX_PENDING_GROUPS,
   type LaunchProfileInput, type RelayConfig, type SavedPeer, type SavedPendingGroup, type SavedServer, type SavedState,
 } from './saved-state.js';
 
@@ -332,7 +333,22 @@ export class SeedHostApplication {
     return server;
   }
 
+  /**
+   * Refuse a mutation that would grow `state.json` past the bounds `open()` enforces. Runs before any copy,
+   * download or remote enrollment, so a refusal costs nothing and the profile always stays reopenable.
+   */
+  private assertCapacity(addingServers = 0, addingPendingGroups = 0): void {
+    if (this.saved.servers.length + addingServers > MAX_LIBRARY_SERVERS) {
+      throw new Error(`This PC’s library is full (${MAX_LIBRARY_SERVERS} servers). Delete a world you no longer need, then try again. Nothing was copied or changed.`);
+    }
+    if (this.saved.pendingGroups.length + addingPendingGroups > MAX_PENDING_GROUPS) {
+      throw new Error(`This PC already belongs to the maximum of ${MAX_PENDING_GROUPS} hosting groups. Leave a group you no longer use, then try again. Nothing was downloaded or changed.`);
+    }
+  }
+
   private addServer(entry: SavedServer): void {
+    // Defensive: every caller also checks capacity before doing expensive work.
+    if (this.saved.servers.length >= MAX_LIBRARY_SERVERS) throw new Error(`This PC’s library is full (${MAX_LIBRARY_SERVERS} servers).`);
     const first = this.saved.servers.length === 0;
     this.saved.servers.push(entry);
     this.saved.activeServerId = entry.id;
@@ -538,6 +554,10 @@ export class SeedHostApplication {
 
   /** Atomically replace state.json: write and flush a temporary, rename it, then flush the directory entry. */
   private async persist(): Promise<void> {
+    // Last line of defence: never durably replace state.json with a shape `open()` would refuse.
+    if (this.saved.servers.length > MAX_LIBRARY_SERVERS || this.saved.pendingGroups.length > MAX_PENDING_GROUPS) {
+      throw new Error('Refusing to save a library beyond its supported size; nothing was written.');
+    }
     const file = path.join(this.root, 'state.json');
     const temporary = `${file}.${randomUUID()}.tmp`;
     const handle = await open(temporary, 'wx', 0o600);
@@ -814,6 +834,7 @@ export class SeedHostApplication {
     if (!input || input.eulaAccepted !== true) throw new Error('Explicit Minecraft EULA acceptance is required before creating a server');
     input = { ...input }; // Capture consent before the lock's first asynchronous fence.
     return this.operation('createServer', async () => {
+      this.assertCapacity(1);
       let parent = this.root;
       if (downloadParent !== undefined) {
         if (typeof downloadParent !== 'string' || !path.isAbsolute(downloadParent)) throw new Error('Choose an absolute download folder');
@@ -869,6 +890,7 @@ export class SeedHostApplication {
     this.assertStopped();
     if (!confirmedStopped) throw new Error('Confirm the source server is stopped before importing');
     await this.operation('importServer', async () => {
+      this.assertCapacity(1);
       const result = await importServer(source, path.join(this.root, 'managed'));
       const ledgerFile = path.join(this.root, `ownership-${randomUUID()}.sqlite`);
       await new OwnershipLedger(ledgerFile, this.identity.fingerprint).initialize(result.snapshot.id);
@@ -1649,6 +1671,12 @@ export class SeedHostApplication {
     const previousPeers = this.saved.peers;
     const previousPending = this.saved.pendingGroups;
     const targetGroup = input.target ? input.target.group : undefined;
+    // A join that only re-confirms known membership consumes no slot; a brand-new pending group must fit the
+    // format `open()` accepts. Checked BEFORE redemption so a refusal never enrolls this PC on the relay.
+    if (!input.target && !this.saved.servers.some((entry) => entry.group?.fingerprint === input.invite.relayFingerprint) &&
+        !this.saved.pendingGroups.some((entry) => entry.fingerprint === input.invite.relayFingerprint)) {
+      this.assertCapacity(0, 1);
+    }
     const joined = await joinRelayInvite(this.identity, input.code, input.memberName);
     const peer = validatePeer({ name: joined.relayName, fingerprint: input.invite.relayFingerprint, host: input.invite.host, port: input.invite.port });
     // Re-verify the target after the await: a switch mid-enrollment must never rebind a different world.
@@ -2113,6 +2141,7 @@ export class SeedHostApplication {
   /** Claim the group's world into a NEW library server. Never touches the files or ledger of any existing world. */
   private async claimIntoNewServer(group: SavedPendingGroup, token: symbol): Promise<void> {
     const me = this.identity.fingerprint;
+    this.assertCapacity(1);
     const peer = this.saved.peers.find((entry) => entry.fingerprint === group.fingerprint);
     if (!peer) throw new Error('This hosting group’s always-on PC is missing from trusted peers. Restore its peer entry before claiming.');
     const status = await this.reachRelay(peer, 'Nothing was changed.');

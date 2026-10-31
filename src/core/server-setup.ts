@@ -327,17 +327,32 @@ export class ServerSetupClient {
       await mkdir(temporary);
       for (const entry of entries) if (entry.type === 'directory') await mkdir(path.join(temporary, ...entry.name.split('/')), { recursive: true });
       const queue = entries.filter(entry => entry.type === 'file');
+      // One failure cancels the other workers and every one is drained BEFORE the catch removes staging: a worker
+      // still awaiting bytes would otherwise recreate the directory and keep writing after setup already failed.
+      const cancel = new AbortController();
+      const signal = AbortSignal.any([operation, cancel.signal]);
+      let firstError: unknown;
       const worker = async () => {
-        for (let entry = queue.shift(); entry; entry = queue.shift()) {
-          if (entry.type !== 'file') continue;
-          const bytes = entry.size ? await this.bytes(entry.url, ['piston-data.mojang.com', 'launcher.mojang.com'], entry.size, operation) : Buffer.alloc(0);
-          if (bytes.length !== entry.size || createHash('sha1').update(bytes).digest('hex') !== entry.sha1) throw new Error('Java runtime integrity check failed');
-          const target = path.join(temporary, ...entry.name.split('/'));
-          await mkdir(path.dirname(target), { recursive: true });
-          await writeFile(target, bytes, { flag: 'wx', mode: entry.executable ? 0o755 : 0o644 });
+        for (;;) {
+          if (cancel.signal.aborted) return;
+          const entry = queue.shift();
+          if (!entry || entry.type !== 'file') { if (!entry) return; continue; }
+          try {
+            const bytes = entry.size ? await this.bytes(entry.url, ['piston-data.mojang.com', 'launcher.mojang.com'], entry.size, signal) : Buffer.alloc(0);
+            if (bytes.length !== entry.size || createHash('sha1').update(bytes).digest('hex') !== entry.sha1) throw new Error('Java runtime integrity check failed');
+            if (cancel.signal.aborted) return;
+            const target = path.join(temporary, ...entry.name.split('/'));
+            await mkdir(path.dirname(target), { recursive: true });
+            if (cancel.signal.aborted) return;
+            await writeFile(target, bytes, { flag: 'wx', mode: entry.executable ? 0o755 : 0o644 });
+          } catch (error) {
+            if (!firstError) { firstError = error; cancel.abort(error); }
+            return;
+          }
         }
       };
       await Promise.all(Array.from({ length: 6 }, worker));
+      if (firstError) throw firstError;
       if (process.platform !== 'win32') for (const entry of entries) if (entry.type === 'link') {
         const target = path.join(temporary, ...entry.name.split('/'));
         await mkdir(path.dirname(target), { recursive: true });

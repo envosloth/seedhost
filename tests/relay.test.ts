@@ -1,6 +1,6 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import fsPromises, { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import fsPromises, { access, cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { Writable } from 'node:stream';
@@ -10,7 +10,9 @@ import { createIdentity, connectPeer, readFrame, writeFrame, type PeerIdentity }
 import { SeedHostApplication } from '../src/core/application.js';
 import { OwnershipLedger } from '../src/core/ownership.js';
 import { RelayNode } from '../src/core/relay.js';
-import { relayStatus, relayRecoverCheckout } from '../src/core/relay-client.js';
+import { relayStatus, relayRecoverCheckout, openRelayOperation, relayRequest } from '../src/core/relay-client.js';
+import { createSnapshot } from '../src/core/snapshots.js';
+import { receiveSnapshot, sendSnapshotToPeer } from '../src/core/transfers.js';
 
 const fixture = path.resolve('tools/fake-java-server.mjs');
 const quiet = () => {};
@@ -466,4 +468,79 @@ test('the relay refuses devices it does not trust', async (t) => {
   const stranger = await createIdentity();
   await assert.rejects(relayStatus(stranger, { fingerprint: relay.identity.fingerprint, ...relay.endpoint! }), /disconnect|closed|reject/i);
   await assert.rejects(connectPeer(stranger, 'f'.repeat(64), relay.endpoint!.host, relay.endpoint!.port), /pin|fingerprint/i);
+});
+
+/**
+ * Retrying an offer the relay already accepted is a documented, idempotent recovery path. It must stay an
+ * acknowledgment: replaying older history may never promote those revisions into the retention head, and the
+ * revision custody holds now must survive every retry so another member can still claim it.
+ */
+async function replayRetentionScenario(t: TestContext, keepRevisions: number) {
+  const { root, source } = await workspace(t, `relay-replay-retention-${keepRevisions}-`);
+  const relay = await startRelay(t, root, undefined, { keepRevisions });
+  const a = await createIdentity(), b = await createIdentity(), c = await createIdentity();
+  for (const [name, identity] of [['a', a], ['b', b], ['c', c]] as const) await relay.trust(name, identity.fingerprint);
+  await relay.setOwner(a.fingerprint);
+  const peer = { fingerprint: relay.identity.fingerprint, ...relay.endpoint! };
+  const stores = new Map([[a.fingerprint, path.join(root, 'store-a')], [b.fingerprint, path.join(root, 'store-b')], [c.fingerprint, path.join(root, 'store-c')]]);
+  const ledgers = new Map([[a.fingerprint, new OwnershipLedger(path.join(root, 'a.sqlite'), a.fingerprint)], [b.fingerprint, new OwnershipLedger(path.join(root, 'b.sqlite'), b.fingerprint)]]);
+  const first = await createSnapshot(source, stores.get(a.fingerprint)!);
+  await ledgers.get(a.fingerprint)!.initialize(first.id);
+  const records: Array<{ identity: PeerIdentity; store: string; snapshotId: string; offer: Awaited<ReturnType<OwnershipLedger['prepareTransfer']>> }> = [];
+  let latest = first.id;
+  for (let revision = 0; revision <= keepRevisions; revision++) {
+    const holder = revision === 0 ? a : (revision % 2 === 1 ? b : a);
+    const ledger = ledgers.get(holder.fingerprint)!;
+    if (revision > 0) {
+      const claim = await openRelayOperation(holder, peer, 'claim');
+      try {
+        await receiveSnapshot(claim, peer.fingerprint, stores.get(holder.fingerprint)!, async (snapshot, from, offer) => {
+          await ledger.acceptTransfer(offer!, from, snapshot.id); return true;
+        });
+      } finally { claim.destroy(); }
+      await relay.settled();
+    }
+    await writeFile(path.join(source, 'world.bin'), `revision ${revision}`);
+    const snapshot = await createSnapshot(source, stores.get(holder.fingerprint)!);
+    await ledger.updateSnapshot(snapshot.id);
+    const offer = await ledger.prepareTransfer(peer.fingerprint, snapshot.id);
+    const sent = await sendSnapshotToPeer(holder, peer, stores.get(holder.fingerprint)!, snapshot.id, offer, { preface: relayRequest('park') });
+    assert.equal(sent.ownershipAccepted, true);
+    await ledger.confirmTransfer(offer.id, peer.fingerprint);
+    await relay.settled();
+    records.push({ identity: holder, store: stores.get(holder.fingerprint)!, snapshotId: snapshot.id, offer });
+    latest = snapshot.id;
+  }
+  const before = await relay.custody();
+  assert.equal(before?.snapshotId, latest, 'the relay holds the newest parked revision');
+  // Exact retries of older, already accepted parks — the recovery path this protocol documents.
+  for (const record of records.slice(0, -1)) {
+    const replayed = await sendSnapshotToPeer(record.identity, peer, record.store, record.snapshotId, record.offer, { preface: relayRequest('park') });
+    assert.equal(replayed.ownershipAccepted, true);
+    await relay.settled();
+  }
+  assert.deepEqual(await relay.custody(), before, 'an accepted replay never changes the revision custody holds');
+  const snapshots = path.join(root, 'relay', 'store', 'snapshots');
+  const held = JSON.parse(await readFile(path.join(snapshots, `${latest}.json`), 'utf8')) as { files: Array<{ hash: string }> };
+  await access(path.join(snapshots, `${latest}.json`));
+  for (const file of held.files) await access(path.join(root, 'relay', 'store', 'objects', file.hash));
+  // A different member can still claim the newest bytes after every replay.
+  const storeC = stores.get(c.fingerprint)!;
+  const ledgerC = new OwnershipLedger(path.join(root, 'c.sqlite'), c.fingerprint);
+  const claim = await openRelayOperation(c, peer, 'claim');
+  let claimed: string | undefined;
+  try {
+    await receiveSnapshot(claim, peer.fingerprint, storeC, async (snapshot, from, offer) => {
+      await ledgerC.acceptTransfer(offer!, from, snapshot.id); claimed = snapshot.id; return true;
+    });
+  } finally { claim.destroy(); }
+  await relay.settled();
+  assert.equal(claimed, latest);
+  const bytes = JSON.parse(await readFile(path.join(storeC, 'snapshots', `${latest}.json`), 'utf8')) as { files: Array<{ hash: string }> };
+  const worldObject = bytes.files.find((file) => file.hash === (held.files.find((candidate) => candidate.hash === file.hash)?.hash));
+  assert.ok(worldObject);
+  await access(path.join(storeC, 'objects', worldObject.hash));
+}
+test('accepted replays of older parks never remove the revision the relay holds', async (t) => {
+  for (const keepRevisions of [1, 10]) await t.test(`keep ${keepRevisions}`, (sub) => replayRetentionScenario(sub, keepRevisions));
 });
