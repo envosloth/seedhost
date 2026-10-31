@@ -144,6 +144,22 @@ async function requireFreeSpace(directory: string, needed: number, reserve: numb
   }
 }
 
+/** Preflight the materialized copy as well as transfer bytes, on its actual destination volume. */
+export async function requireFreeSpaceFor(directory: string, neededBytes: number, reserveBytes = DEFAULT_RESERVE_BYTES): Promise<void> {
+  if (!Number.isSafeInteger(neededBytes) || neededBytes < 0) throw new RangeError('neededBytes must be a non-negative safe integer');
+  if (!Number.isSafeInteger(reserveBytes) || reserveBytes < 0) throw new RangeError('reserveBytes must be a non-negative safe integer');
+  let probe = path.resolve(directory);
+  for (;;) {
+    try { await requireFreeSpace(probe, neededBytes, reserveBytes); return; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      const parent = path.dirname(probe);
+      if (parent === probe) throw error;
+      probe = parent;
+    }
+  }
+}
+
 export interface SendResult { snapshot: SnapshotManifest; filesSent: number; bytesSent: number; ownershipAccepted: boolean }
 
 /**
@@ -161,8 +177,8 @@ export async function sendSnapshotToPeer(identity: PeerIdentity, peer: TransferP
 }
 
 /** Send a snapshot over an already pinned socket, in either connection direction. The caller owns the socket. */
-export async function sendSnapshot(socket: TLSSocket, storeDir: string, snapshotId: string, offer?: TransferOffer): Promise<SendResult> {
-  return sendPrepared(socket, await prepareSend(storeDir, snapshotId, offer));
+export async function sendSnapshot(socket: TLSSocket, storeDir: string, snapshotId: string, offer?: TransferOffer, beforeComplete?: () => Promise<void>): Promise<SendResult> {
+  return sendPrepared(socket, await prepareSend(storeDir, snapshotId, offer), beforeComplete);
 }
 
 async function prepareSend(storeDir: string, snapshotId: string, offer?: TransferOffer) {
@@ -176,7 +192,7 @@ async function prepareSend(storeDir: string, snapshotId: string, offer?: Transfe
   return { storeDir, snapshotId, snapshot, offer: validated, batches: fileBatches(snapshot.files), objects: objectsOf(snapshot.files) };
 }
 
-async function sendPrepared(socket: TLSSocket, { storeDir, snapshotId, snapshot, offer, batches, objects }: Awaited<ReturnType<typeof prepareSend>>): Promise<SendResult> {
+async function sendPrepared(socket: TLSSocket, { storeDir, snapshotId, snapshot, offer, batches, objects }: Awaited<ReturnType<typeof prepareSend>>, beforeComplete?: () => Promise<void>): Promise<SendResult> {
   {
     await writeTransferFrame(socket, { type: 'snapshot', version: PROTOCOL_VERSION, snapshotId, parentId: snapshot.parentId,
       fileCount: snapshot.files.length, offer: offer ?? null });
@@ -212,6 +228,8 @@ async function sendPrepared(socket: TLSSocket, { storeDir, snapshotId, snapshot,
         bytesSent += size;
       } finally { await handle.close(); }
     }
+    // Receiver callbacks cannot accept authority before complete. Fence cancellation durably first.
+    await beforeComplete?.();
     await writeTransferFrame(socket, { type: 'complete', snapshotId, filesSent, bytesSent });
     const ack = await frame(socket, SLOW_PHASE_TIMEOUT_MS);
     fields(ack, ['type', 'snapshotId', 'filesSent', 'bytesSent', 'ownershipAccepted']);

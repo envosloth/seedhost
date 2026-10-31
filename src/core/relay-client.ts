@@ -8,7 +8,7 @@ import { friendName, validateServerMetadata } from './relay-friends-store.js';
 
 /** Relay connections start with one of these frames; `park` and `claim` then run the ordinary transfer protocol. */
 export const RELAY_PROTOCOL_VERSION = 1;
-export type RelayOperation = 'withdraw-offer' | 'recovery-status' | 'status' | 'park' | 'claim' | 'join' | 'invite' | 'friends' | 'gateway-status' | 'game-tunnel' | 'public-status' | 'public-enable' | 'public-disable' | 'remove-friend' | 'invite-for' | 'disband' | 'disband-status' | 'leave' | 'leave-status' | 'initial-publish' | 'host-start' | 'host-running' | 'host-cancel' | 'host-stopped' | 'server-metadata';
+export type RelayOperation = 'recover-checkout' | 'withdraw-offer' | 'recovery-status' | 'status' | 'park' | 'claim' | 'join' | 'invite' | 'friends' | 'gateway-status' | 'game-tunnel' | 'public-status' | 'public-enable' | 'public-disable' | 'remove-friend' | 'invite-for' | 'disband' | 'disband-status' | 'leave' | 'leave-status' | 'initial-publish' | 'host-start' | 'host-running' | 'host-cancel' | 'host-stopped' | 'server-metadata';
 export const relayRequest = (op: RelayOperation) => ({ type: 'relay', version: RELAY_PROTOCOL_VERSION, op });
 
 /** The only hostnames this app's public addresses take; shared by the relay store and its clients. */
@@ -165,6 +165,14 @@ export async function relayLeaveGroup(identity: PeerIdentity, relay: RelayPeer):
   try { status = await relayLeaveStatus(identity, relay); }
   catch (error) { throw new Error('Leave was not verified. Retain the local group and retry on this PC when the relay is online.', {cause: failure ?? error}); }
   if (!status.left) throw failure ?? new Error('Member leave could not be verified; local association retained');
+}
+
+export async function relayRecoverCheckout(identity: PeerIdentity, relay: RelayPeer, fingerprint: string): Promise<void> {
+  if (!hex(fingerprint)) throw new Error('Invalid pending recipient');
+  const reply = await friendRequest(identity, relay, { ...relayRequest('recover-checkout'), fingerprint });
+  if (Object.keys(reply).sort().join(',') !== 'fingerprint,type' || reply.type !== 'relay-checkout-recovered' || reply.fingerprint !== fingerprint) throw new Error('Checkout recovery acknowledgment could not be verified');
+  const status = await relayStatus(identity, relay);
+  if (!status || status.state !== 'owned' || status.owner !== relay.fingerprint || status.pendingTarget !== null) throw new Error('Checkout recovery readback changed or is unavailable; nothing may start from this receipt');
 }
 
 export async function relayRemoveFriend(identity: PeerIdentity, relay: RelayPeer, fingerprint: string): Promise<void> {

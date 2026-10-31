@@ -8,13 +8,13 @@ import { ServerProcess } from './launcher.js';
 import { preflightMinecraftPort } from './port-preflight.js';
 import { readAdmission, saveAdmission, type AdmissionJournal } from './recovery-journal.js';
 import { OwnershipLedger, canAcceptOffer, type TransferOffer } from './ownership.js';
-import { receiveSnapshot, sendSnapshotToPeer } from './transfers.js';
+import { receiveSnapshot, requireFreeSpaceFor, sendSnapshotToPeer } from './transfers.js';
 import { listenPeer, type PeerIdentity } from './peer-transport.js';
 import { addMods, exportClientPack, modsDirectory, ordinaryDirectory, removeMod, type ModKind } from './mods.js';
 import { ModrinthClient, assertModTarget, isGameVersion, isModLoader, isProjectKey, type ModSort } from './modrinth.js';
 import { indexedMods, modTarget, readModIndex, writeModIndex, type ModVerificationCache } from './mod-index.js';
 import { installMod, assertModInstallComplete, type InstallModInput } from './mod-install.js';
-import { openRelayOperation, relayRequest, relayStatus, relayInitialPublish, relayHostState, relayWithdrawOffer, relayRecoveryStatus, openRelayHostSession, relayInvite, relayInviteFor, relayRemoveFriend, relayFriends, relaySetServerName, relayDisbandGroup, relayDisbandStatus, relayLeaveGroup, joinRelayInvite, validHostEndpoint, type RelayStatus, relayPublic, type RelayHostSession } from './relay-client.js';
+import { openRelayOperation, relayRequest, relayStatus, relayInitialPublish, relayHostState, relayWithdrawOffer, relayRecoveryStatus, openRelayHostSession, relayInvite, relayInviteFor, relayRemoveFriend, relayRecoverCheckout, relayFriends, relaySetServerName, relayDisbandGroup, relayDisbandStatus, relayLeaveGroup, joinRelayInvite, validHostEndpoint, type RelayStatus, relayPublic, type RelayHostSession } from './relay-client.js';
 import { decodeInvite, type Invite } from './invites.js';
 import { friendName, fingerprintOK } from './relay-friends-store.js';
 import { initializeOnboardingScope, readOnboarding, saveOnboarding, validateOnboarding, onboardingChecks, type SetupConfiguration } from './onboarding.js';
@@ -87,6 +87,9 @@ export async function groupJavaLaunchArgs(serverDir: string, localArgs: string[]
 }
 
 const isStoppedState = (state: string | undefined) => state === undefined || state === 'offline' || state === 'failed';
+
+/** Only installation strictly before any authority write may produce a definitive decline. */
+class IncomingPreAcceptanceDecline extends Error {}
 
 export class SeedHostApplication {
   private opened = false;
@@ -1011,7 +1014,11 @@ export class SeedHostApplication {
       if (!peer) throw new Error('Missing pinned hosting group endpoint');
       // Reject a known local conflict before publishing or cycling this holder's custody.
       if (bound[0]) await preflightMinecraftPort(bound[0].serverDir);
-      const initial = await this.reachRelay(peer, 'Hosting status is unknown; nothing was started.');
+      let initial = await this.reachRelay(peer, 'Hosting status is unknown; nothing was started.');
+      if (initial?.state === 'offered' && initial.pendingTarget !== this.identity.fingerprint && (await relayFriends(this.identity, peer)).canManage) {
+        await relayRecoverCheckout(this.identity, peer, initial.pendingTarget!);
+        initial = await this.reachRelay(peer, 'Recovered checkout readback unavailable; nothing was started.');
+      }
       if (!initial) {
         this.busy = 'startGroup: publishing initial stopped server';
         if (bound[0]) {
@@ -2068,17 +2075,20 @@ export class SeedHostApplication {
       const socket = await openRelayOperation(this.identity, relay, 'claim');
       let activation: Promise<boolean> | undefined;
       let accepted = false;
+      let decline: IncomingPreAcceptanceDecline | undefined;
       try {
         await receiveSnapshot(socket, relay.fingerprint, path.join(this.root, 'managed', 'store'), async (snapshot, source, offer) => {
-          accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, canonicalName });
+          try { accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, canonicalName }); }
+          catch (error) { if (!(error instanceof IncomingPreAcceptanceDecline)) throw error; decline = error; }
           return accepted;
         });
       } catch (error) {
-        throw new Error(`Claim did not complete (${(error as Error).message}). If this PC accepted, it holds the server now; the relay keeps the claim pending for this PC only. Retry the claim to finish it; it is never applied twice.`, { cause: error });
+        throw new Error(`Claim did not complete (${(error as Error).message}). Nothing was started. A failed download does not grant ownership. If acceptance may have completed, retry this PC's exact claim to reconcile it safely; it is never applied twice.`, { cause: error });
       } finally {
         await activation?.catch((error) => this.log('Claim activation failed: ' + String(error)));
         socket.destroy();
       }
+      if (decline) throw decline;
       if (!accepted) throw new Error('The relay sent no ownership offer; nothing changed.');
       this.log('Claimed the server from the relay. Configure this PC\'s launch profile and approve executable/mod trust before starting.');
   }
@@ -2119,17 +2129,20 @@ export class SeedHostApplication {
     const socket = await openRelayOperation(this.identity, peer, 'claim');
     let activation: Promise<boolean> | undefined;
     let accepted = false;
+    let decline: IncomingPreAcceptanceDecline | undefined;
     try {
       await receiveSnapshot(socket, peer.fingerprint, path.join(this.root, 'managed', 'store'), async (snapshot, source, offer) => {
-        accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, appendGroup: group, canonicalName });
+        try { accepted = await this.considerIncoming(socket, token, snapshot, source, offer, (pending) => { activation = pending; }, { approved: true, appendGroup: group, canonicalName }); }
+        catch (error) { if (!(error instanceof IncomingPreAcceptanceDecline)) throw error; decline = error; }
         return accepted;
       });
     } catch (error) {
-      throw new Error(`Claim did not complete (${(error as Error).message}). If this PC accepted, it holds the server now; the group keeps the claim pending for this PC only. Retry the claim to finish it; it is never applied twice.`, { cause: error });
+      throw new Error(`Claim did not complete (${(error as Error).message}). Nothing was started. A failed download does not grant ownership. If acceptance may have completed, retry this PC's exact claim to reconcile it safely; it is never applied twice.`, { cause: error });
     } finally {
       await activation?.catch((error) => this.log('Claim activation failed: ' + String(error)));
       socket.destroy();
     }
+    if (decline) throw decline;
     if (!accepted) throw new Error('The group sent no ownership offer; nothing changed.');
     this.log('Claimed the group’s world into a new library server. Configure this PC’s launch profile and approve executable/mod trust before starting.');
   }
@@ -2156,6 +2169,15 @@ export class SeedHostApplication {
       this.log('Peer receive failed: ' + String(error));
     } finally {
       socket.destroy();
+    }
+  }
+
+  private async materializeIncomingBeforeAuthority(storeDir: string, serverDir: string, snapshot: SnapshotManifest): Promise<void> {
+    try {
+      await requireFreeSpaceFor(serverDir, snapshot.files.reduce((sum, file) => sum + file.size, 0));
+      await materializeSnapshot(storeDir, snapshot.id, serverDir);
+    } catch (error) {
+      throw new IncomingPreAcceptanceDecline(`Checkout declined before ownership acceptance: ${(error as Error).message}`, { cause: error });
     }
   }
 
@@ -2217,7 +2239,7 @@ export class SeedHostApplication {
     }
     const storeDir = path.join(this.root, 'managed', 'store');
     const serverDir = path.join(this.root, 'managed', 'servers', randomUUID());
-    await materializeSnapshot(storeDir, snapshot.id, serverDir);
+    await this.materializeIncomingBeforeAuthority(storeDir, serverDir, snapshot);
     revalidate();
     const ledgerFile = previous?.ledgerFile ?? path.join(this.root, `ownership-${randomUUID()}.sqlite`);
     const profile = previous ? { ...previous.profile, args: [...previous.profile.args] } : validateLaunchProfile({ executable: '', args: [] }, true);
@@ -2272,7 +2294,7 @@ export class SeedHostApplication {
     const previousPending = this.saved.pendingGroups;
     const storeDir = path.join(this.root, 'managed', 'store');
     const serverDir = path.join(this.root, 'managed', 'servers', randomUUID());
-    await materializeSnapshot(storeDir, snapshot.id, serverDir);
+    await this.materializeIncomingBeforeAuthority(storeDir, serverDir, snapshot);
     const candidate: SavedServer = { id: newServerId(), name: canonicalName ?? 'Shared server (name unavailable)', serverDir, storeDir, snapshotId: snapshot.id,
       profile: validateLaunchProfile({ executable: '', args: [] }, true), ledgerFile: path.join(this.root, `ownership-${randomUUID()}.sqlite`),
       group: { fingerprint: group.fingerprint, parkOnStop: group.parkOnStop } };

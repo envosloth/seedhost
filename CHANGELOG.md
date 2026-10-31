@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — failed-checkout recovery
+
+- A recipient that runs out of space before accepting ownership no longer leaves the hosting group permanently reserved to that PC. The relay durably fences and releases proven pre-acceptance failures.
+- Installation-volume checks include the materialized working copy. Installation failures before authority return a definitive decline while retaining the actionable disk error and the member's previous world.
+- Group-owner Start and member removal recover abandoned pre-complete checkout after restart; stale transfer streams cannot subsequently authorize ownership.
+- Lost acknowledgments, legacy records without completion evidence, and other completed streams that might still accept remain fenced. This is not a force-unlock or an automatic repair of historical pending checkouts.
+- Update the group relay and participating hosting PCs together, with old relay writers stopped. The local verification candidate retains the baseline version and is not a published update.
+
 ## 0.6.8-alpha
 
 Unsigned portable Windows alpha. Update all participating hosting PCs and the group relay before testing. Keep independent world backups; no automatic installation or live-world migration is performed by publishing this release.

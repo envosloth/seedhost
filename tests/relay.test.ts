@@ -1,13 +1,16 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import fsPromises, { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { Writable } from 'node:stream';
 import { createServer } from 'node:net';
 import path from 'node:path';
-import { createIdentity, connectPeer, type PeerIdentity } from '../src/core/peer-transport.js';
+import { createIdentity, connectPeer, readFrame, writeFrame, type PeerIdentity } from '../src/core/peer-transport.js';
 import { SeedHostApplication } from '../src/core/application.js';
 import { OwnershipLedger } from '../src/core/ownership.js';
 import { RelayNode } from '../src/core/relay.js';
-import { relayStatus } from '../src/core/relay-client.js';
+import { relayStatus, relayRecoverCheckout } from '../src/core/relay-client.js';
 
 const fixture = path.resolve('tools/fake-java-server.mjs');
 const quiet = () => {};
@@ -57,6 +60,235 @@ async function closedPort(): Promise<number> {
   await new Promise<void>((resolve) => server.close(() => resolve()));
   return port;
 }
+test('low-storage group Start leaves the world available for a different member to start', async (t) => {
+  const { root, source } = await workspace(t, 'relay-low-storage-start-');
+  const relay = await startRelay(t, root);
+  const a = (await host(t, root, 'a', relay)).app;
+  const b = (await host(t, root, 'b', relay)).app;
+  const c = (await host(t, root, 'c', relay)).app;
+  await a.importExisting(source, true);
+  await a.parkAtRelay();
+  const before = await held(relay);
+  const fault = t.mock.method(fsPromises, 'statfs', async () => ({ bavail: 0n, bsize: 4096n }));
+  syncBuiltinESMExports();
+  try { await assert.rejects(b.startGroup(relay.identity.fingerprint, true), (error: Error) => {
+    assert.match(error.message, /Insufficient disk space/);
+    assert.doesNotMatch(error.message, /keeps the claim pending/, 'failed downloads must not claim they permanently reserved the group');
+    return true;
+  }); }
+  finally { fault.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal((await b.getState()).server, null, 'failed download never accepted ownership');
+  assert.deepEqual(await held(relay), before, 'failed download must not leave a pending checkout');
+  await c.startGroup(relay.identity.fingerprint, true);
+  assert.equal((await c.getState()).server!.state, 'running');
+  assert.equal(await world(c), 'original');
+  await c.stopServer();
+});
+
+test('install-volume disk full after complete definitively declines without pending custody', async (t) => {
+  const { root, source } = await workspace(t, 'relay-install-full-');
+  const relay = await startRelay(t, root);
+  const a = (await host(t, root, 'a', relay)).app;
+  const b = (await host(t, root, 'b', relay)).app;
+  const c = (await host(t, root, 'c', relay)).app;
+  await a.importExisting(source, true);
+  await a.parkAtRelay();
+  // A verified cached download needs no new transfer bytes, but installation still needs space.
+  await cp((await a.getState()).server!.storeDir, path.join(root, 'b', 'managed', 'store'), { recursive: true });
+  const fault = t.mock.method(fsPromises, 'statfs', async () => ({ bavail: 0n, bsize: 4096n }));
+  syncBuiltinESMExports();
+  try { await assert.rejects(b.startGroup(relay.identity.fingerprint, true), /Checkout declined before ownership acceptance: Insufficient disk space/); }
+  finally { fault.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal((await b.getState()).server, null, 'no authority or library entry committed');
+  assert.equal((await held(relay))!.state, 'owned', 'definitive pre-acceptance refusal releases relay');
+  await c.startGroup(relay.identity.fingerprint, true);
+  assert.equal((await c.getState()).server!.state, 'running');
+  await c.stopServer();
+});
+
+test('ENOSPC while installing a returning member preserves its old world and releases checkout', async (t) => {
+  const { root, source } = await workspace(t, 'relay-install-enospc-');
+  const relay = await startRelay(t, root);
+  const a = (await host(t, root, 'a', relay)).app;
+  const b = (await host(t, root, 'b', relay)).app;
+  const c = (await host(t, root, 'c', relay)).app;
+  await a.importExisting(source, true); await a.parkAtRelay();
+  await b.claimFromRelay();
+  const previous = (await b.getState()).server!;
+  await b.parkAtRelay();
+  const before = (await b.getState()).server!;
+  const createWriteStream = fs.createWriteStream;
+  let injected = false;
+  const fault = t.mock.method(fs, 'createWriteStream', (filename: Parameters<typeof fs.createWriteStream>[0], ...args: any[]) => {
+    const target = String(filename);
+    if (target.startsWith(path.join(root, 'b', 'managed', 'servers') + path.sep) && target.includes('.seedhost-staging-')) {
+      injected = true;
+      return new Writable({ write(_chunk, _encoding, callback) { callback(Object.assign(new Error('ENOSPC: disk filled during installation'), { code: 'ENOSPC' })); } });
+    }
+    return createWriteStream(filename, ...args);
+  });
+  syncBuiltinESMExports();
+  try { await assert.rejects(b.startGroup(relay.identity.fingerprint, true), /Checkout declined before ownership acceptance: ENOSPC/); }
+  finally { fault.mock.restore(); syncBuiltinESMExports(); }
+  assert.equal(injected, true, 'fault reached materialized-file writes, not the disk preflight');
+  assert.equal((await b.getState()).server!.serverDir, previous.serverDir);
+  assert.deepEqual((await b.getState()).server!.ownership, before.ownership);
+  assert.equal(await world(b), 'original', 'previous execution files were retained');
+  assert.equal((await held(relay))!.state, 'owned');
+  await c.startGroup(relay.identity.fingerprint, true);
+  assert.equal((await c.getState()).server!.state, 'running');
+  await c.stopServer();
+});
+
+test('a decline cannot cancel custody while another checkout stream can still accept', async (t) => {
+  const { root, source } = await workspace(t, 'relay-concurrent-decline-');
+  const relay = await startRelay(t, root);
+  const a = (await host(t, root, 'a', relay)).app;
+  const { identity: ib } = await host(t, root, 'b', relay);
+  await a.importExisting(source, true); await a.parkAtRelay();
+  const other = new RelayNode(path.join(root, 'relay'), relay.identity, { log: quiet });
+  await other.open(); await other.listen(); t.after(() => other.close());
+  const first = await connectPeer(ib, relay.identity.fingerprint, relay.endpoint!.host, relay.endpoint!.port);
+  const second = await connectPeer(ib, other.identity.fingerprint, other.endpoint!.host, other.endpoint!.port);
+  t.after(() => { first.destroy(); second.destroy(); });
+  const complete = async (socket: typeof first) => {
+    await writeFrame(socket, { type: 'relay', version: 1, op: 'claim' });
+    const hello = await readFrame(socket) as {fileCount: number; snapshotId: string};
+    let count = 0;
+    while (count < hello.fileCount) count += (await readFrame(socket) as {files: unknown[]}).files.length;
+    await writeFrame(socket, { type: 'need', hashes: [] });
+    assert.equal((await readFrame(socket) as {type: string}).type, 'complete');
+    return hello.snapshotId;
+  };
+  try {
+    const snapshotId = await complete(first);
+    await complete(second);
+    await writeFrame(first, { type: 'ack', snapshotId, filesSent: 0, bytesSent: 0, ownershipAccepted: false });
+    first.destroy(); await relay.settled();
+    assert.equal((await held(relay))!.state, 'offered', 'one decline cannot speak for another callback');
+    await writeFrame(second, { type: 'ack', snapshotId, filesSent: 0, bytesSent: 0, ownershipAccepted: true });
+    second.destroy(); await other.settled();
+    assert.equal((await held(other))!.state, 'transferred');
+  } finally { first.destroy(); second.destroy(); }
+});
+
+test('owner Start recovers a durable pre-complete checkout after restart and fences its stale sender', async (t) => {
+  const { root, source } = await workspace(t, 'relay-owner-recovery-');
+  const relay = await startRelay(t, root);
+  const { app: a, identity: ia } = await host(t, root, 'a', relay);
+  const { identity: ib } = await host(t, root, 'b', relay);
+  await relay.setOwner(ia.fingerprint);
+  await a.importExisting(source, true);
+  await profile(a);
+  await a.parkAtRelay();
+  const ledger = new OwnershipLedger(path.join(root, 'relay', 'ownership.sqlite'), relay.identity.fingerprint);
+  const custody = await ledger.status();
+  const abandoned = await ledger.prepareTransfer(ib.fingerprint, custody.snapshotId, true);
+  await relay.close();
+  await relay.open();
+  await relay.listen();
+  await a.addPeer({ name: 'Relay', fingerprint: relay.identity.fingerprint, ...relay.endpoint! });
+  await a.startGroup(relay.identity.fingerprint, true);
+  assert.equal((await a.getState()).server!.state, 'running');
+  assert.equal(await ledger.hasWithdrawn(abandoned.id), true);
+  await assert.rejects(ledger.markCheckoutAcceptancePossible(abandoned.id, ib.fingerprint), /fenced|changed/);
+  await a.stopServer();
+});
+
+test('owner member removal recovers only a proven pre-complete checkout', async (t) => {
+  const { root, source } = await workspace(t, 'relay-remove-recovery-');
+  const relay = await startRelay(t, root);
+  const { app: a, identity: ia } = await host(t, root, 'a', relay);
+  const { identity: ib } = await host(t, root, 'b', relay);
+  await relay.setOwner(ia.fingerprint);
+  await a.importExisting(source, true);
+  await a.parkAtRelay();
+  const ledger = new OwnershipLedger(path.join(root, 'relay', 'ownership.sqlite'), relay.identity.fingerprint);
+  const custody = await ledger.status();
+  const abandoned = await ledger.prepareTransfer(ib.fingerprint, custody.snapshotId, true);
+  await a.removeFriend(ib.fingerprint);
+  assert.equal((await held(relay))!.state, 'owned');
+  assert.equal(await ledger.hasWithdrawn(abandoned.id), true);
+  await assert.rejects(ledger.markCheckoutAcceptancePossible(abandoned.id, ib.fingerprint), /fenced|changed/);
+});
+
+test('legacy and acceptance-possible checkouts refuse owner recovery, Start and removal', async (t) => {
+  for (const phase of ['legacy', 'acceptance-possible']) await t.test(phase, async (t) => {
+    const { root, source } = await workspace(t, 'relay-unknown-checkout-');
+    const relay = await startRelay(t, root);
+    const { app: a, identity: ia } = await host(t, root, 'a', relay);
+    const { identity: ib } = await host(t, root, 'b', relay);
+    await relay.setOwner(ia.fingerprint);
+    await a.importExisting(source, true);
+    await profile(a);
+    await a.parkAtRelay();
+    const ledger = new OwnershipLedger(path.join(root, 'relay', 'ownership.sqlite'), relay.identity.fingerprint);
+    const custody = await ledger.status();
+    const offer = await ledger.prepareTransfer(ib.fingerprint, custody.snapshotId, phase !== 'legacy');
+    if (phase !== 'legacy') await ledger.markCheckoutAcceptancePossible(offer.id, ib.fingerprint);
+    const before = await ledger.status();
+    const peer = { fingerprint: relay.identity.fingerprint, ...relay.endpoint! };
+    await assert.rejects(relayRecoverCheckout(ib, peer, ib.fingerprint), /Only the group owner/);
+    await assert.rejects(relayRecoverCheckout(ia, peer, ib.fingerprint), /possible or unknown/);
+    await assert.rejects(a.startGroup(relay.identity.fingerprint, true), /possible or unknown/);
+    await assert.rejects(a.removeFriend(ib.fingerprint), /possible or unknown/);
+    assert.deepEqual(await ledger.status(), before);
+    assert.notEqual((await a.getState()).server!.state, 'running');
+    assert.equal(await ledger.hasWithdrawn(offer.id), false);
+  });
+});
+
+test('independent relay cancellation fences a sender paused immediately before complete', async (t) => {
+  const { root, source } = await workspace(t, 'relay-completion-race-');
+  const relay = await startRelay(t, root);
+  const { app: a, identity: ia } = await host(t, root, 'a', relay);
+  const { identity: ib } = await host(t, root, 'b', relay);
+  await relay.setOwner(ia.fingerprint);
+  await a.importExisting(source, true);
+  await a.parkAtRelay();
+  const other = new RelayNode(path.join(root, 'relay'), relay.identity, { log: quiet });
+  await other.open(); await other.listen(); t.after(() => other.close());
+  const socket = await connectPeer(ib, relay.identity.fingerprint, relay.endpoint!.host, relay.endpoint!.port);
+  try {
+    await writeFrame(socket, { type: 'relay', version: 1, op: 'claim' });
+    const hello = await readFrame(socket) as { fileCount: number };
+    let count = 0;
+    while (count < hello.fileCount) count += (await readFrame(socket) as { files: unknown[] }).files.length;
+    const ledger = new OwnershipLedger(path.join(root, 'relay', 'ownership.sqlite'), relay.identity.fingerprint);
+    const offer = (await ledger.status()).offer!;
+    await assert.rejects(relayRecoverCheckout(ib, { fingerprint: other.identity.fingerprint, ...other.endpoint! }, ib.fingerprint), /Only the group owner/);
+    await relayRecoverCheckout(ia, { fingerprint: other.identity.fingerprint, ...other.endpoint! }, ib.fingerprint);
+    await writeFrame(socket, { type: 'need', hashes: [] });
+    assert.equal((await readFrame(socket) as { type: string }).type, 'error', 'cancelled sender emits no complete frame');
+    await relay.settled();
+    assert.equal((await ledger.status()).state, 'owned');
+    assert.equal(await ledger.hasWithdrawn(offer.id), true);
+  } finally { socket.destroy(); }
+});
+
+test('a failed ownership commit is not misclassified as an installation decline', async (t) => {
+  const { root, source } = await workspace(t, 'relay-commit-unknown-');
+  const relay = await startRelay(t, root);
+  const { app: a, identity: ia } = await host(t, root, 'a', relay);
+  const { app: b, identity: ib } = await host(t, root, 'b', relay);
+  await relay.setOwner(ia.fingerprint);
+  await a.importExisting(source, true); await a.parkAtRelay();
+  const accept = OwnershipLedger.prototype.acceptTransfer;
+  const fault = t.mock.method(OwnershipLedger.prototype, 'acceptTransfer', async function (this: OwnershipLedger, ...args: Parameters<OwnershipLedger['acceptTransfer']>) {
+    await accept.apply(this, args);
+    if (this.deviceId === ib.fingerprint) throw new Error('Simulated failure after durable ownership commit');
+  });
+  try { await assert.rejects(b.claimFromRelay(), /after durable ownership commit/); }
+  finally { fault.mock.restore(); }
+  assert.equal((await b.getState()).server!.ownership.state, 'owned');
+  assert.equal((await held(relay))!.state, 'offered');
+  await assert.rejects(a.claimFromRelay(), /pending checkout/);
+  await assert.rejects(a.startGroup(relay.identity.fingerprint, true), /possible or unknown/);
+  await assert.rejects(a.removeFriend(ib.fingerprint), /possible or unknown/);
+  await b.claimFromRelay();
+  assert.equal((await held(relay))!.state, 'transferred');
+});
+
 const world = async (app: SeedHostApplication) => readFile(path.join((await app.getState()).server!.serverDir, 'world.bin'), 'utf8');
 
 test('ordinary group Start and mandatory Stop carry the latest server while the previous holder is off', async (t) => {

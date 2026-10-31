@@ -11,6 +11,10 @@ export interface OwnershipState {
   offer?:TransferOffer;
   /** The offer this device accepted to become owner. Lets a retried offer be re-acknowledged instead of re-applied. */
   acceptedOfferId?:string;
+  /** Relay checkout only: missing metadata means legacy/unknown, never safely cancellable. */
+  checkoutPhase?:'streaming'|'acceptance-possible';
+  /** Lifetime completion permissions for this exact checkout, including retried streams. */
+  checkoutCompletions?:number;
 }
 export interface TransferOffer {id:string;lineage:string;source:string;target:string;generation:number;snapshotId:string}
 
@@ -166,8 +170,36 @@ export class OwnershipLedger {
   async updateSnapshot(snapshotId:string):Promise<void>{
     await this.transaction(async s=>{if(!s||s.owner!==this.deviceId||s.state!=='owned')throw new Error('Snapshot update requires stopped, safely owned server');return {state:{...s,snapshotId},value:undefined};});
   }
-  async prepareTransfer(target:string,snapshotId:string):Promise<TransferOffer>{
-    return this.transaction(async s=>{if(s?.state==='hosting')throw new Error('Stop hosting before handoff');if(!s||s.owner!==this.deviceId||s.state!=='owned'||s.snapshotId!==snapshotId)throw new Error('Ownership or revision mismatch');if(!target||target===this.deviceId)throw new Error('Invalid target device');const lineage=s.lineage??randomUUID();const offer={id:randomUUID(),lineage,source:this.deviceId,target,generation:s.generation+1,snapshotId};return {state:{...s,lineage,state:'offered',offer},value:offer};});
+  async prepareTransfer(target:string,snapshotId:string,fencedCheckout=false):Promise<TransferOffer>{
+    return this.transaction(async s=>{if(s?.state==='hosting')throw new Error('Stop hosting before handoff');if(!s||s.owner!==this.deviceId||s.state!=='owned'||s.snapshotId!==snapshotId)throw new Error('Ownership or revision mismatch');if(!target||target===this.deviceId)throw new Error('Invalid target device');const lineage=s.lineage??randomUUID();const offer={id:randomUUID(),lineage,source:this.deviceId,target,generation:s.generation+1,snapshotId};return {state:{...s,lineage,state:'offered',offer,...(fencedCheckout?{checkoutPhase:'streaming' as const,checkoutCompletions:0}:{})},value:offer};});
+  }
+  /** Must share the relay admission lock with cancellation. Persist BEFORE sending complete. */
+  async markCheckoutAcceptancePossible(offerId:string,target:string):Promise<void>{
+    await this.transaction(async s=>{
+      if(!s || s.state!=='offered' || s.owner!==this.deviceId || s.offer?.id!==offerId || s.offer.target!==target)throw new Error('Checkout was fenced or changed before completion');
+      if(s.checkoutPhase && (!Number.isSafeInteger(s.checkoutCompletions) || s.checkoutCompletions!<0 || s.checkoutCompletions===Number.MAX_SAFE_INTEGER))throw new Error('Checkout completion fence metadata is unavailable');
+      return {state:{...s,...(s.checkoutPhase?{checkoutPhase:'acceptance-possible' as const,checkoutCompletions:s.checkoutCompletions!+1}:{})},value:undefined};
+    });
+  }
+  /** Compare-and-fence only when no receiver has ever been allowed to accept this offer. */
+  async cancelUncommittedCheckout(offerId:string,target:string):Promise<boolean>{
+    return this.transaction(async(s,db)=>{
+      if(!s)throw new Error('Missing checkout custody');
+      if(s.state!=='offered' || s.owner!==this.deviceId || s.offer?.id!==offerId || s.offer.target!==target || s.checkoutPhase!=='streaming' || s.checkoutCompletions!==0)return {state:s,value:false};
+      db.prepare('INSERT OR IGNORE INTO withdrawn_offers(id,data) VALUES (?,?)').run(offerId,JSON.stringify(s.offer));
+      const {offer:_offer,checkoutPhase:_phase,checkoutCompletions:_completions,...rest}=s;
+      return {state:{...rest,state:'owned'},value:true};
+    });
+  }
+  /** A pinned false ACK resolves the sole completed stream, never any other outstanding callback. */
+  async cancelDeclinedCheckout(offerId:string,target:string):Promise<boolean>{
+    return this.transaction(async(s,db)=>{
+      if(!s)throw new Error('Missing checkout custody');
+      if(s.state!=='offered' || s.owner!==this.deviceId || s.offer?.id!==offerId || s.offer.target!==target || s.checkoutPhase!=='acceptance-possible' || s.checkoutCompletions!==1)return {state:s,value:false};
+      db.prepare('INSERT OR IGNORE INTO withdrawn_offers(id,data) VALUES (?,?)').run(offerId,JSON.stringify(s.offer));
+      const {offer:_offer,checkoutPhase:_phase,checkoutCompletions:_completions,...rest}=s;
+      return {state:{...rest,state:'owned'},value:true};
+    });
   }
   async acceptTransfer(offer:TransferOffer,authenticatedSource:string,verifiedSnapshotId:string):Promise<void>{
     if(!offer || offer.source!==authenticatedSource)throw new Error('Authenticated source does not match offer');

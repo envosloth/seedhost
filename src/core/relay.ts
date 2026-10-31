@@ -191,6 +191,22 @@ export class RelayNode {
     await this.game?.validate();
   }
 
+  /** Owner-only recovery bypasses a stalled stream queue but shares its durable completion/admission fence. */
+  async recoverCheckout(source: string, fingerprint: string): Promise<void> {
+    if (!fingerprintOK(fingerprint)) throw new Error('Invalid pending recipient');
+    await withRelayLock(this.root, async () => {
+      await this.reload(); this.requireMember(source);
+      if (this.config.owner !== source) throw new Error('Only the group owner can recover a checkout');
+      await this.requireNoPendingStart();
+      if ((await this.hostObservation())?.state === 'hosting') throw new Error('Hosting is unresolved; checkout recovery is blocked');
+      const ledger = this.ledger(), state = await ledger.status();
+      if (state.state !== 'offered' || state.offer?.target !== fingerprint || !await ledger.cancelUncommittedCheckout(state.offer.id, fingerprint)) {
+        throw new Error('Checkout acceptance is possible or unknown; the recipient must retry the exact claim and hand the world back. A lost acknowledgment is not cancellation.');
+      }
+    });
+    await this.game?.validate();
+  }
+
   async removeFriend(source: string, fingerprint: string): Promise<void> {
     if (!fingerprintOK(fingerprint)) throw new Error('Invalid friend');
     // Serialize with custody transfers, then recheck authority under the durable configuration lock.
@@ -199,8 +215,13 @@ export class RelayNode {
       if (config.owner !== source) throw new Error('Only the group owner can remove a member');
       if (fingerprint === config.owner) throw new Error('The group owner cannot be removed');
       await this.requireNoPendingStart(fingerprint);
-      const custody = await this.custody();
-      if (custody?.owner === fingerprint || custody?.pendingTarget === fingerprint) throw new Error('Ask this friend to hand the world back before removing them');
+      let custody = await this.custody();
+      if (custody?.pendingTarget === fingerprint) {
+        const state = await this.ledger().status();
+        if (!state.offer || !await this.ledger().cancelUncommittedCheckout(state.offer.id, fingerprint)) throw new Error('Checkout acceptance is possible or unknown; this friend must retry the exact claim and hand the world back before removal.');
+        custody = await this.custody();
+      }
+      if (custody?.owner === fingerprint) throw new Error('Ask this friend to hand the world back before removing them');
       if (!config.trusted.some(m => m.fingerprint === fingerprint)) return;
       config.trusted = config.trusted.filter(m => m.fingerprint !== fingerprint);
       await this.removeInvites(record => record.issuer === fingerprint || record.recipient === fingerprint);
@@ -454,8 +475,8 @@ export class RelayNode {
     let retained = false;
     try {
       const request = await readInviteFrame(socket, 4096, REQUEST_TIMEOUT_MS) as Record<string, unknown>;
-      if (!request || request.type !== 'relay' || request.version !== RELAY_PROTOCOL_VERSION || !['withdraw-offer', 'recovery-status', 'status', 'park', 'claim', 'join', 'invite', 'friends', 'gateway-status', 'game-tunnel', 'public-status', 'public-enable', 'public-disable', 'remove-friend', 'invite-for', 'disband', 'disband-status', 'leave', 'leave-status', 'initial-publish', 'host-start', 'host-running', 'host-cancel', 'host-stopped', 'server-metadata'].includes(request.op as string) ||
-          Object.keys(request).length !== (['host-start', 'host-running', 'host-cancel', 'host-stopped'].includes(request.op as string) ? 7 : request.op === 'join' || request.op === 'game-tunnel' ? 5 : request.op === 'withdraw-offer' || request.op === 'remove-friend' || request.op === 'invite-for' || request.op === 'server-metadata' ? 4 : 3)) {
+      if (!request || request.type !== 'relay' || request.version !== RELAY_PROTOCOL_VERSION || !['recover-checkout', 'withdraw-offer', 'recovery-status', 'status', 'park', 'claim', 'join', 'invite', 'friends', 'gateway-status', 'game-tunnel', 'public-status', 'public-enable', 'public-disable', 'remove-friend', 'invite-for', 'disband', 'disband-status', 'leave', 'leave-status', 'initial-publish', 'host-start', 'host-running', 'host-cancel', 'host-stopped', 'server-metadata'].includes(request.op as string) ||
+          Object.keys(request).length !== (['host-start', 'host-running', 'host-cancel', 'host-stopped'].includes(request.op as string) ? 7 : request.op === 'join' || request.op === 'game-tunnel' ? 5 : request.op === 'recover-checkout' || request.op === 'withdraw-offer' || request.op === 'remove-friend' || request.op === 'invite-for' || request.op === 'server-metadata' ? 4 : 3)) {
         throw new Error('Unsupported relay request; both ends must run the same SeedHost alpha');
       }
       if (request.op === 'join') {
@@ -482,6 +503,11 @@ export class RelayNode {
         return;
       }
       this.requireMember(source);
+      if (request.op === 'recover-checkout') {
+        await this.recoverCheckout(source, request.fingerprint as string);
+        await writeFrame(socket, { type: 'relay-checkout-recovered', fingerprint: request.fingerprint });
+        return;
+      }
       if (request.op === 'server-metadata') {
         await this.mutate(async config => {
           this.requireMember(source, config);
@@ -734,7 +760,7 @@ export class RelayNode {
       const custody = await this.custody();
       if (!custody) throw new Error('The relay holds no server yet. Park one on it first.');
       if (custody.state === 'owned') {
-        const prepared = await ledger.prepareTransfer(target, custody.snapshotId);
+        const prepared = await ledger.prepareTransfer(target, custody.snapshotId, true);
         await this.game?.validate();
         return prepared;
       }
@@ -750,14 +776,18 @@ export class RelayNode {
       throw new Error(`The server is checked out by ${name} (generation ${custody.generation}). Ask ${name} to park it on the relay.`);
     });
     let result;
-    try { result = await sendSnapshot(socket, this.store, offer.snapshotId, offer); }
+    try { result = await sendSnapshot(socket, this.store, offer.snapshotId, offer, () => withRelayLock(this.root, async () => {
+      await this.reload(); this.requireMember(target);
+      await ledger.markCheckoutAcceptancePossible(offer.id, target);
+    })); }
     catch (error) {
-      this.log(`Claim by ${who} did not complete (${(error as Error).message}); it stays pending for ${who} to retry.`);
+      const recovered = await withRelayLock(this.root, async () => ledger.cancelUncommittedCheckout(offer.id, target));
+      this.log(`Claim by ${who} did not complete (${(error as Error).message}); ${recovered ? 'pre-acceptance checkout was safely fenced and returned to the relay' : 'acceptance is possible or unknown; it stays pending for the same PC to retry'}.`);
       throw error;
     }
     if (!result.ownershipAccepted) {
-      await ledger.cancelTransfer(offer.id, target);
-      this.log(`${who} declined the claim; the relay still holds the server.`);
+      const recovered = await withRelayLock(this.root, async () => ledger.cancelDeclinedCheckout(offer.id, target));
+      this.log(`${who} declined this claim attempt; ${recovered ? 'the relay safely holds the server' : 'another or earlier acceptance remains possible; exact recipient reconciliation is required'}.`);
       return;
     }
     await ledger.confirmTransfer(offer.id, target);
