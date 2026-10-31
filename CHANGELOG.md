@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased — audit fixes
+## 0.6.9-alpha
+
+Unsigned portable Windows alpha. Update the group relay and every participating hosting PC together before using
+Multi-host Start: an older relay does not enforce the durable checkout fence, and an older host does not read the
+replay-safe retention rules. Keep independent world backups. Publishing this release does not install anything, migrate
+a live world, or repair the historical pending checkout described below.
 
 - The relay's retention now always keeps the revision its custody ledger currently holds, and an accepted retry of an
   older park is an acknowledgment only. Before this change a replayed retry could prune the authoritative revision, so
@@ -16,17 +21,21 @@
   reported as complete while truncated. `writeZip` still publishes only through a flushed temporary file.
 - A failed Java runtime download cancels its remaining workers and waits for all of them before deleting staging, so no
   worker can recreate the download folder and keep writing after setup reported failure.
-- The desktop runtime moves to Electron 44.10.1 (patched line for the compromised-intermediate-certificate advisory)
-  and the build tooling pins patched `glob`/`minimatch` through package overrides. Verify the packaged executable's
-  embedded versions before publishing; this entry does not claim a published artifact.
+- The desktop runtime moves to Electron 44.10.1, which carries the certificate mitigation and embeds Undici 7.30.1;
+  build tooling pins patched `glob`/`minimatch`/`undici` through package overrides. `npm audit` is clean for this tree.
+- A recipient that runs out of space before accepting ownership no longer leaves the hosting group permanently reserved
+  to that PC. The relay durably fences and releases proven pre-acceptance failures.
+- Installation-volume checks include the materialized working copy. Installation failures before authority return a
+  definitive decline while retaining the actionable disk error and the member's previous world.
+- Group-owner Start and member removal recover abandoned pre-complete checkout after restart; stale transfer streams
+  cannot subsequently authorize ownership.
+- Lost acknowledgments, legacy records without completion evidence, and other completed streams that might still accept
+  remain fenced. This is not a force-unlock or an automatic repair of historical pending checkouts.
+- Update the group relay and participating hosting PCs together, with old relay writers stopped.
 
-## Unreleased — failed-checkout recovery
-
-- A recipient that runs out of space before accepting ownership no longer leaves the hosting group permanently reserved to that PC. The relay durably fences and releases proven pre-acceptance failures.
-- Installation-volume checks include the materialized working copy. Installation failures before authority return a definitive decline while retaining the actionable disk error and the member's previous world.
-- Group-owner Start and member removal recover abandoned pre-complete checkout after restart; stale transfer streams cannot subsequently authorize ownership.
-- Lost acknowledgments, legacy records without completion evidence, and other completed streams that might still accept remain fenced. This is not a force-unlock or an automatic repair of historical pending checkouts.
-- Update the group relay and participating hosting PCs together, with old relay writers stopped. The local verification candidate retains the baseline version and is not a published update.
+Known limits: a legacy pending checkout created before this release (for example the historical `jyzputin` record) is
+still not auto-cleared — unknown acceptance is not permission to host. Replayed parks are accepted, but the relay now
+prunes while holding its mutation lock, so retention on a very large store delays concurrent parks and claims.
 
 ## 0.6.8-alpha
 
